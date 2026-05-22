@@ -1,0 +1,12 @@
+make a new python file in the same folder. The python file requirements are:
+1. name it signal_mesh_orchestrator.py file.
+2. use analysis_prompts.py as an import.
+3. First see cli options based on that the file must do actions.
+4. Action will be fetch_data(currently 1, many more may come). 
+5. when this fetch_data is asked for, then the scirpt should access ALL_PROMPTS in  analysis_prompts file.
+6. Then member of the ALL_PROMPTS contain 5 prompts. 
+7. Use cluade code command line interface and get the results of each prompt in mentioned json format for each prompt. 
+8. collect them simlar to how the orchestrator_v2.py is doing it.
+9. For prompts, the script needs to get particular stocks data, this you can yahoo finance to fetch the data. 
+10. So for the step9 part, use a prompt STEP1_PROMPT to get the 5 stock data, which will be later used by each sub prompts in ALL_PROMPTS.
+11. Only use clode code CLI and then get the output using system process.
