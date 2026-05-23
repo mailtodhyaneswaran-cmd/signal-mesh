@@ -916,7 +916,7 @@ def send_telegram_notification(results: list[dict], agents_label: str, euro: boo
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 7 — ACTIONS
 # ══════════════════════════════════════════════════════════════════════════════
-def action_fetch_data(euro: bool = False, agent_name: str = "claude", bulk_prompt: bool = False, threaded: bool = False):
+def action_fetch_data(euro: bool = False, agent_name: str = "claude", bulk_prompt: bool = False, threaded: bool = False, stock: str = None):
     # Build agent list for Step 3 (Step 1 always uses Claude)
     if agent_name == "all":
         agents = [ClaudeAgent(verbose=VERBOSE), GeminiAgent(verbose=VERBOSE), MistralAgent(verbose=VERBOSE)]
@@ -932,16 +932,21 @@ def action_fetch_data(euro: bool = False, agent_name: str = "claude", bulk_promp
     currency_sym = "€" if euro else "$"
     bulk_label   = "  [BULK MODE: 1 call/category]" if bulk_prompt else ""
     thread_label = "  [THREADED: agents run in parallel]" if threaded and len(agents) > 1 else ""
+    stock_label  = f"  stock=[{stock.upper()}]" if stock else ""
     print(f"\n{'='*60}")
-    print(f"  SIGNAL MESH — fetch_data  [{mode}]  agents=[{agents_label}]{bulk_label}{thread_label}")
+    print(f"  SIGNAL MESH — fetch_data  [{mode}]  agents=[{agents_label}]{bulk_label}{thread_label}{stock_label}")
     print(f"  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC")
     print(f"{'='*60}\n")
 
-    # Step 1 — always Claude regardless of --agent flag
-    print("[Step 1] Discovering trending stocks via Claude (always)...")
-    step1_agent = ClaudeAgent(verbose=VERBOSE)
-    tickers = discover_trending_stocks(step1_agent)
-    tickers = tickers[:NUM_STOCKS]
+    # Step 1 — skip when --stock is provided, otherwise discover via Claude
+    if stock:
+        tickers = [stock.upper()]
+        print(f"[Step 1] Skipped — using provided ticker: {stock.upper()}")
+    else:
+        print("[Step 1] Discovering trending stocks via Claude (always)...")
+        step1_agent = ClaudeAgent(verbose=VERBOSE)
+        tickers = discover_trending_stocks(step1_agent)
+        tickers = tickers[:NUM_STOCKS]
 
     # Step 2 — fetch yfinance data for each ticker
     print(f"\n[Step 2] Fetching yfinance data for: {' '.join(tickers)}")
@@ -1037,6 +1042,12 @@ def main():
         help="Run agents in parallel threads (each agent runs all prompts independently) instead of round-robin",
     )
     parser.add_argument(
+        "--stock", "-s",
+        default=None,
+        metavar="TICKER",
+        help="Skip stock discovery (Step 1) and analyse this specific ticker directly (e.g. NVDA, ASML, AAPL)",
+    )
+    parser.add_argument(
         "--output", "-o",
         nargs="?",
         const="auto",
@@ -1059,7 +1070,7 @@ def main():
         print(f"[OUTPUT] Saving to: {out_path}\n")
 
     try:
-        ACTIONS[args.action](euro=args.euro, agent_name=args.agent, bulk_prompt=args.bulk_prompt, threaded=args.thread)
+        ACTIONS[args.action](euro=args.euro, agent_name=args.agent, bulk_prompt=args.bulk_prompt, threaded=args.thread, stock=args.stock)
     finally:
         if tee:
             tee.close()

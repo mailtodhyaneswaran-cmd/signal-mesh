@@ -2,6 +2,54 @@
 
 ---
 
+## 2026-05-23 — `--stock` flag + Telegram bot
+
+**Files added:** `int/bin/telegram_bot.py`
+**Files changed:** `int/bin/signal_mesh_orchestrator.py`
+
+### What changed
+
+**1. `--stock` / `-s` CLI flag**
+- Skips Step 1 (stock discovery via Claude) and runs analysis directly for the provided ticker.
+- Accepts any ticker symbol recognised by yfinance (e.g. `NVDA`, `ASML.AS`, `SAP.DE`).
+- All other flags (`--agent`, `--bulk_prompt`, `--thread`, `--euro`, `--output`) still apply.
+- Usage:
+  ```
+  python int/bin/signal_mesh_orchestrator.py fetch_data --stock NVDA --agent all
+  python int/bin/signal_mesh_orchestrator.py fetch_data -s ASML.AS -e --agent all --bulk_prompt
+  ```
+
+**2. `int/bin/telegram_bot.py` — interactive Telegram bot**
+- Long-polling bot (no webhook needed, works from any network).
+- Accepts commands only from `TELEGRAM_CHAT_ID` configured in `.env` (all other senders are silently ignored).
+- **`/ticker <STOCK> [agent]`** — runs Signal Mesh analysis for that stock and replies with results.
+  - `agent` defaults to `claude`; valid values: `claude · gemini · mistral · all`
+  - Sends an acknowledgment immediately, runs analysis in a background thread, sends result when done.
+- **`/help`** — shows usage and ticker format guide.
+- Ticker format guide included in bot help:
+  - US: `NVDA`, `AAPL`, `MSFT`
+  - EU: `ASML.AS`, `SAP.DE`, `MC.PA` (exchange suffix required)
+  - ETFs: `SPY`, `QQQ`, `IWDA.AS`
+- Usage:
+  ```
+  python int/bin/telegram_bot.py
+  ```
+
+### Example bot interaction
+```
+You:  /ticker NVDA all
+Bot:  🔍 Starting analysis for NVDA with [Claude + Gemini + Mistral]...
+Bot:  ⏳ Fetching market data for NVDA...
+Bot:  📈 Data fetched. Running 25 prompts... (This takes a few minutes)
+Bot:  📊 Signal Mesh — NVDA
+      2026-05-23 09:14 UTC  ·  [Claude + Gemini + Mistral]
+      🟢 BUY  score: 71.4
+      Votes: 32 BUY · 8 SELL · 10 HOLD (50 total)
+      ...
+```
+
+---
+
 ## 2026-05-22 — Parallel Threads + NUM_STOCKS
 
 **File changed:** `int/bin/signal_mesh_orchestrator.py`
