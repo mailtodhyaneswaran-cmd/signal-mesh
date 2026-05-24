@@ -27,6 +27,20 @@ MISTRAL_MODEL     = "mistral-small-latest"   # swap to mistral-medium-latest / m
 RETRY_DELAY_LIMIT = 300                       # seconds — give up if delay exceeds this
 
 
+def _parse_retry_delay(exc: Exception) -> float | None:
+    """Extract retry delay in seconds from a 429 Too Many Requests exception."""
+    msg = str(exc)
+    # "Retry-After: 30" or "retry_after=30.5"
+    match = re.search(r"retry.?after[=:\s]+([0-9.]+)", msg, re.IGNORECASE)
+    if match:
+        return float(match.group(1))
+    # "Please retry in 30s" or "wait 30 seconds"
+    match = re.search(r"(?:retry in|wait)\s+([0-9.]+)\s*s", msg, re.IGNORECASE)
+    if match:
+        return float(match.group(1))
+    return None
+
+
 def _load_dotenv() -> None:
     """Walk up from this file to find a .env and load it into os.environ."""
     current = Path(__file__).resolve().parent
@@ -98,7 +112,7 @@ class MistralAgent(BaseAgent):
                 print(f"{'─' * 60}\n")
 
             if not output:
-                return {"error": "empty response from Mistral", "signal": "HOLD", "factor_score": 50}
+                return {"error": "empty response from Mistral"}
 
             # Direct JSON parse
             try:
@@ -121,25 +135,27 @@ class MistralAgent(BaseAgent):
                 except json.JSONDecodeError:
                     pass
 
-            return {"error": "unparseable response", "raw": output[:300], "signal": "HOLD", "factor_score": 50}
+            return {"error": "unparseable response", "raw": output[:300]}
 
         except Exception as e:
             msg = str(e)
-            is_rate_limit = "429" in msg or "rate" in msg.lower() or "too many" in msg.lower()
+            is_rate_limit = "429" in msg or "rate limit" in msg.lower() or "too many requests" in msg.lower()
             if is_rate_limit and not _is_retry:
                 return self._handle_rate_limit(e, prompt)
-            return {"error": f"Mistral API error: {e}", "signal": "HOLD", "factor_score": 50}
+            return {"error": f"Mistral API error: {e}"}
 
     def _handle_rate_limit(self, exc: Exception, prompt: str) -> dict:
-        msg = str(exc)
-        match = re.search(r"retry.?after[:\s]+([0-9.]+)", msg, re.IGNORECASE)
-        delay = float(match.group(1)) if match else 30.0
+        print(f"\n[MISTRAL] Rate limited (429 Too Many Requests).")
+        delay = _parse_retry_delay(exc)
+        if delay is None:
+            print("[MISTRAL] Could not parse retry delay from error — giving up.")
+            return {"error": f"Mistral API error: {exc}"}
 
-        print(f"\n[MISTRAL] Rate limited (429). retryDelay={delay:.0f}s")
         if delay > RETRY_DELAY_LIMIT:
-            print(f"[MISTRAL] retryDelay exceeds {RETRY_DELAY_LIMIT}s limit — giving up.")
-            return {"error": "timeout: rate limit retry delay too long", "signal": "HOLD", "factor_score": 50}
+            print(f"[MISTRAL] retryDelay={delay:.1f}s exceeds {RETRY_DELAY_LIMIT}s limit — TIMEOUT.")
+            return {"error": "timeout: rate limit retry delay too long"}
 
+        print(f"[MISTRAL] retryDelay={delay:.1f}s — waiting before retry…")
         for remaining in range(int(delay), 0, -1):
             print(f"\r[MISTRAL] Retrying in {remaining}s…  ", end="", flush=True)
             time.sleep(1)
