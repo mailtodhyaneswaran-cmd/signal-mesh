@@ -55,6 +55,8 @@ HOLD — everything else
 | Telegram notification with results + reliability | ✅ |
 | Automated daily run Mon–Fri 09:00 AM (Windows Task Scheduler) | ✅ |
 | Configurable stock count (`NUM_STOCKS`) | ✅ |
+| Single-stock mode — skip discovery, analyse one ticker directly (`--stock`) | ✅ |
+| Telegram bot — trigger analysis on demand via `/ticker` command | ✅ |
 
 ---
 
@@ -78,6 +80,7 @@ signal_mesh/
     ├── lib_env.py                    # .env loader (no external deps)
     ├── ask_gemini.py                 # CLI wrapper to test Gemini directly
     ├── ask_mistral.py                # CLI wrapper to test Mistral directly
+    ├── telegram_bot.py               # Interactive Telegram bot (/ticker command)
     ├── test_telegram.py              # Sends a sample Telegram notification
     └── outputs/                      # Timestamped run output files (gitignored)
 ```
@@ -155,6 +158,19 @@ python int/bin/signal_mesh_orchestrator.py fetch_data --agent all --output
 # saves to int/bin/outputs/signal_mesh_YYYY-MM-DD_HHMMSS.txt
 ```
 
+### Analyse a specific stock (skip discovery)
+
+```bash
+# Analyse NVDA with all agents
+python int/bin/signal_mesh_orchestrator.py fetch_data --stock NVDA --agent all
+
+# Analyse a European stock in EUR mode
+python int/bin/signal_mesh_orchestrator.py fetch_data --stock ASML.AS --euro --agent all
+
+# Quick single-stock check with Claude only
+python int/bin/signal_mesh_orchestrator.py fetch_data -s AAPL
+```
+
 ### Full production run (all flags)
 
 ```bash
@@ -169,11 +185,26 @@ python int/bin/signal_mesh_orchestrator.py fetch_data -v -e --agent all --bulk_p
 |---|---|---|
 | `fetch_data` | | Action to run (required) |
 | `--agent` | `-a` | `claude` (default) · `gemini` · `mistral` · `all` |
+| `--stock` | `-s` | Skip discovery — analyse this specific ticker directly |
 | `--euro` | `-e` | Use Trade Republic / EUR prompt set |
 | `--verbose` | `-v` | Print every prompt input and agent output |
 | `--bulk_prompt` | | 1 LLM call per category instead of 25 |
 | `--thread` | `-t` | Agents run all prompts in parallel threads |
 | `--output` | `-o` | Save output to file (auto-timestamped) |
+
+### Ticker format for `--stock`
+
+Uses yfinance ticker symbols:
+
+| Market | Example tickers |
+|---|---|
+| US stocks | `NVDA`, `AAPL`, `MSFT`, `TSLA` |
+| Amsterdam (AEX) | `ASML.AS`, `HEIA.AS`, `PHIA.AS` |
+| Frankfurt (XETRA) | `SAP.DE`, `BMW.DE`, `SIE.DE` |
+| Paris (Euronext) | `MC.PA`, `TTE.PA`, `AIR.PA` |
+| ETFs | `SPY`, `QQQ`, `IWDA.AS` |
+
+EU stocks require the exchange suffix (`.AS`, `.DE`, `.PA`). Without it yfinance falls back to the US-listed ADR, which may have different pricing data.
 
 ---
 
@@ -240,6 +271,62 @@ To test Telegram without running a full analysis:
 ```bash
 python int/bin/test_telegram.py
 ```
+
+---
+
+## Telegram Bot (On-Demand Analysis)
+
+`telegram_bot.py` is a persistent bot that listens for commands and triggers analysis on demand, replying directly in the chat.
+
+### Start the bot
+
+```bash
+python int/bin/telegram_bot.py
+```
+
+Leave it running in a terminal. The bot uses long-polling — no webhook or public URL needed.
+
+### Commands
+
+| Command | Description |
+|---|---|
+| `/ticker <STOCK>` | Analyse with Claude (default) |
+| `/ticker <STOCK> all` | Analyse with all 3 agents |
+| `/ticker <STOCK> gemini` | Analyse with Gemini only |
+| `/ticker <STOCK> mistral` | Analyse with Mistral only |
+| `/ticker <STOCK> claude` | Analyse with Claude only |
+| `/help` | Show usage and ticker format guide |
+
+### Example
+
+```
+You:  /ticker NVDA all
+Bot:  🔍 Starting analysis for NVDA with [Claude + Gemini + Mistral]...
+Bot:  ⏳ Fetching market data for NVDA...
+Bot:  📈 Data fetched. Running 25 prompts... (This takes a few minutes)
+
+      — 2–5 minutes later —
+
+Bot:  📊 Signal Mesh — NVDA
+      2026-05-24 09:14 UTC  ·  [Claude + Gemini + Mistral]
+
+      🟢 BUY  score: 71.4
+      Votes: 32 BUY · 8 SELL · 10 HOLD (50 total)
+
+      Category Breakdown:
+        TECH: 74.1
+        FUND: 68.3
+        SENT: 71.0
+        MACR: 69.5
+        QUAN: 72.8
+
+      Agent Reliability:
+        ✅ Claude: 25/25 (100%)
+        ✅ Gemini: 24/25 (96%)
+        ⚠️ Mistral: 18/25 (72%)
+```
+
+The bot only responds to your configured `TELEGRAM_CHAT_ID` — messages from any other chat are silently ignored.
 
 ---
 
