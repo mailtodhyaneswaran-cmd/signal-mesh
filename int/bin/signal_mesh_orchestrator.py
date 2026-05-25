@@ -215,6 +215,308 @@ def fetch_stock_data(ticker: str) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# SECTION 3b — SINGLE-TICKER RICH DATA FETCH  (/get command)
+# Returns all fields required by SINGLE_TICKER_BASELINE_PROMPT and
+# SINGLE_TICKER_DELTA_PROMPT placeholders.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _ema(values: list, period: int) -> list:
+    """Compute EMA of a list of floats using a local helper.
+
+    Initialises from the SMA of the first `period` values, then applies
+    the standard EMA formula.  Pads the front with the initial EMA value
+    so the output has the same length as the input.
+    """
+    if len(values) < period:
+        return values[:]
+    k = 2.0 / (period + 1)
+    seed = sum(values[:period]) / period
+    ema = [seed] * period
+    for v in values[period:]:
+        ema.append(ema[-1] + k * (v - ema[-1]))
+    # Pad front to match input length
+    pad_len = len(values) - len(ema)
+    return [ema[0]] * pad_len + ema
+
+
+def fetch_single_ticker_data(ticker: str) -> dict:
+    """Rich yfinance data fetch for the /get monitoring loop.
+
+    Computes: day_change_pct, SMA20, MACD(12,26,9), Bollinger Bands(20,2),
+    ATR(14), volume metrics, plus all fundamental fields needed by the
+    single-ticker prompts.  Returns a flat dict with keys matching the
+    prompt placeholders exactly.
+    """
+    try:
+        stock = yf.Ticker(ticker)
+        info  = stock.info
+        hist  = stock.history(period="1y")
+    except Exception as e:
+        return {"ticker": ticker, "error": str(e)}
+
+    if hist.empty:
+        return {"ticker": ticker, "error": "no price data returned"}
+
+    closes  = [float(c) for c in hist["Close"].tolist()]
+    highs   = [float(h) for h in hist["High"].tolist()]
+    lows    = [float(l) for l in hist["Low"].tolist()]
+    volumes = [int(v)   for v in hist["Volume"].tolist()]
+
+    if len(closes) < 2:
+        return {"ticker": ticker, "error": "insufficient price history"}
+
+    price = closes[-1]
+
+    # ── Day change % ──────────────────────────────────────────────────────
+    day_change_pct = round((closes[-1] - closes[-2]) / closes[-2] * 100, 2) if closes[-2] != 0 else 0
+
+    # ── 52-week range ─────────────────────────────────────────────────────
+    low_52w  = info.get("fiftyTwoWeekLow",  min(lows))
+    high_52w = info.get("fiftyTwoWeekHigh", max(highs))
+
+    # ── RSI(14) ───────────────────────────────────────────────────────────
+    gains  = [max(closes[i] - closes[i-1], 0) for i in range(1, len(closes))]
+    losses = [max(closes[i-1] - closes[i], 0) for i in range(1, len(closes))]
+    avg_g  = sum(gains[-14:])  / 14 if len(gains)  >= 14 else 0
+    avg_l  = sum(losses[-14:]) / 14 if len(losses) >= 14 else 0.001
+    rsi    = round(100 - (100 / (1 + avg_g / avg_l)), 1)
+
+    # ── SMA20 ─────────────────────────────────────────────────────────────
+    sma20 = round(sum(closes[-20:]) / min(len(closes), 20), 2)
+
+    # ── SMA50 ─────────────────────────────────────────────────────────────
+    sma50 = round(sum(closes[-50:]) / min(len(closes), 50), 2) if len(closes) >= 10 else round(price, 2)
+
+    # ── SMA200 ────────────────────────────────────────────────────────────
+    sma200 = round(sum(closes[-200:]) / min(len(closes), 200), 2) if len(closes) >= 20 else round(price, 2)
+
+    # ── MACD(12, 26, 9) ──────────────────────────────────────────────────
+    ema12 = _ema(closes, 12)
+    ema26 = _ema(closes, 26)
+    macd_line_series  = [round(e12 - e26, 4) for e12, e26 in zip(ema12, ema26)]
+    macd_signal_series = _ema(macd_line_series, 9)
+    macd_line_val   = round(macd_line_series[-1],   4)
+    macd_signal_val = round(macd_signal_series[-1], 4)
+    macd_hist_val   = round(macd_line_val - macd_signal_val, 4)
+
+    # ── Bollinger Bands(20, 2) ────────────────────────────────────────────
+    win20    = closes[-20:] if len(closes) >= 20 else closes
+    bb_mid   = sum(win20) / len(win20)
+    bb_std   = math.sqrt(sum((x - bb_mid) ** 2 for x in win20) / len(win20))
+    bb_upper = round(bb_mid + 2 * bb_std, 2)
+    bb_lower = round(bb_mid - 2 * bb_std, 2)
+    bb_mid   = round(bb_mid, 2)
+
+    # ── ATR(14) using true ranges ─────────────────────────────────────────
+    true_ranges = []
+    for i in range(1, len(closes)):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i]  - closes[i - 1]),
+        )
+        true_ranges.append(tr)
+    atr = round(sum(true_ranges[-14:]) / min(len(true_ranges), 14), 4) if true_ranges else round(price * 0.02, 4)
+
+    # ── Volume ────────────────────────────────────────────────────────────
+    today_vol = volumes[-1] if volumes else 0
+    avg_vol   = round(sum(volumes[-30:]) / min(len(volumes), 30)) if volumes else 0
+
+    # ── Fundamentals from yfinance info ───────────────────────────────────
+    pe_ttm  = info.get("trailingPE")
+    pe_fwd  = info.get("forwardPE")
+    peg     = info.get("pegRatio")
+    eps_growth  = info.get("earningsGrowth")
+    rev_growth  = info.get("revenueGrowth")
+    op_margin   = info.get("operatingMargins")
+    de_ratio    = info.get("debtToEquity")
+    sector      = info.get("sector", "N/A")
+
+    # Format percentages (yfinance returns decimals for growth/margins)
+    def _pct(v):
+        if v is None:
+            return "N/A"
+        return round(float(v) * 100, 1)
+
+    def _round2(v):
+        if v is None:
+            return "N/A"
+        try:
+            return round(float(v), 2)
+        except (TypeError, ValueError):
+            return "N/A"
+
+    # ── Next earnings date ────────────────────────────────────────────────
+    next_earnings_date = "N/A"
+    try:
+        cal = stock.calendar
+        if cal is not None:
+            if hasattr(cal, "get"):
+                # dict-style
+                dates = cal.get("Earnings Date")
+                if dates:
+                    d = dates[0] if isinstance(dates, (list, tuple)) else dates
+                    next_earnings_date = str(d)[:10]
+            elif hasattr(cal, "loc"):
+                # DataFrame-style (older yfinance versions)
+                if "Earnings Date" in cal.index:
+                    d = cal.loc["Earnings Date"].iloc[0] if hasattr(cal.loc["Earnings Date"], "iloc") else cal.loc["Earnings Date"]
+                    next_earnings_date = str(d)[:10]
+    except Exception:
+        next_earnings_date = "N/A"
+
+    return {
+        "ticker":            ticker,
+        "price":             round(price, 2),
+        "day_change_pct":    day_change_pct,
+        "low_52w":           round(float(low_52w),  2),
+        "high_52w":          round(float(high_52w), 2),
+        "rsi":               rsi,
+        "sma20":             sma20,
+        "sma50":             sma50,
+        "sma200":            sma200,
+        "macd_line":         macd_line_val,
+        "macd_signal":       macd_signal_val,
+        "macd_hist":         macd_hist_val,
+        "bb_upper":          bb_upper,
+        "bb_mid":            bb_mid,
+        "bb_lower":          bb_lower,
+        "atr":               atr,
+        "today_vol":         today_vol,
+        "avg_vol":           avg_vol,
+        "pe_ttm":            _round2(pe_ttm),
+        "pe_fwd":            _round2(pe_fwd),
+        "peg":               _round2(peg),
+        "eps_growth":        _pct(eps_growth),
+        "rev_growth":        _pct(rev_growth),
+        "op_margin":         _pct(op_margin),
+        "de_ratio":          _round2(de_ratio),
+        "sector":            sector,
+        "next_earnings_date": next_earnings_date,
+        # Stubs
+        "vix":               18,
+        "rate_trend":        "hold",
+        "sector_perf":       0,
+    }
+
+
+def analyze_single_ticker(
+    ticker: str,
+    stock_data: dict,
+    agent_name: str,
+    run_n: int,
+    session_id: str,
+    interval_min: int,
+    total_runs: int,
+) -> dict:
+    """Run a single-ticker analysis for one /get run.
+
+    Builds baseline or delta prompt depending on run_n, sends it to the
+    selected agent(s), parses the JSON response, and returns the result dict.
+
+    For agent_name='all': runs all 3 agents, takes majority vote on signal,
+    averages factor_score and confidence, and merges catalysts/risks.
+
+    Returns a dict with at least: signal, factor_score, confidence, timestamp, price.
+    On hard failure returns: {"error": "...", "signal": "HOLD", "factor_score": 50, "confidence": 0}.
+    """
+    from lib_agents_claude   import ClaudeAgent
+    from lib_agents_gemini   import GeminiAgent
+    from lib_agents_mistral  import MistralAgent
+    from analysis_prompts    import build_baseline_prompt, build_delta_prompt
+    from lib_get_state       import get_baseline, get_previous_run
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # ── Build prompt ───────────────────────────────────────────────────────
+    if run_n == 1:
+        prompt = build_baseline_prompt(ticker, stock_data, total_runs, interval_min)
+    else:
+        baseline = get_baseline(session_id) or {}
+        previous = get_previous_run(session_id, run_n) or baseline
+        prompt   = build_delta_prompt(
+            ticker, stock_data, run_n, baseline, previous, total_runs, interval_min
+        )
+
+    # ── Build agent list ───────────────────────────────────────────────────
+    if agent_name == "all":
+        agents = [ClaudeAgent(verbose=VERBOSE), GeminiAgent(verbose=VERBOSE), MistralAgent(verbose=VERBOSE)]
+    elif agent_name == "gemini":
+        agents = [GeminiAgent(verbose=VERBOSE)]
+    elif agent_name == "mistral":
+        agents = [MistralAgent(verbose=VERBOSE)]
+    else:
+        agents = [ClaudeAgent(verbose=VERBOSE)]
+
+    # ── Run agent(s) ───────────────────────────────────────────────────────
+    if len(agents) == 1:
+        result = agents[0].fetch_data(prompt)
+        if "error" in result and "signal" not in result:
+            return {"error": result.get("error", "agent error"), "signal": "HOLD", "factor_score": 50, "confidence": 0}
+        result["timestamp"] = now_iso
+        result["price"]     = stock_data.get("price", 0)
+        return result
+
+    # ── Multi-agent: majority vote ─────────────────────────────────────────
+    responses = []
+    for agent in agents:
+        try:
+            r = agent.fetch_data(prompt)
+            if "signal" in r:
+                r["_agent"] = agent.name
+                responses.append(r)
+        except Exception as e:
+            print(f"[analyze_single_ticker] {agent.name} failed: {e}")
+
+    if not responses:
+        return {"error": "all agents failed", "signal": "HOLD", "factor_score": 50, "confidence": 0}
+
+    # Majority vote on signal
+    signals = [r.get("signal", "HOLD") for r in responses]
+    buy_c  = signals.count("BUY")
+    sell_c = signals.count("SELL")
+    hold_c = signals.count("HOLD")
+    total  = len(signals)
+    if   buy_c  / total >= 0.5:  majority_signal = "BUY"
+    elif sell_c / total >= 0.4:  majority_signal = "SELL"
+    else:                         majority_signal = "HOLD"
+
+    # Average numeric fields
+    avg_score = round(sum(r.get("factor_score", 50) or 50 for r in responses) / len(responses))
+    avg_conf  = round(sum(r.get("confidence",   50) or 50 for r in responses) / len(responses))
+
+    # Use first successful result as structural template
+    base = responses[0].copy()
+    base["signal"]       = majority_signal
+    base["factor_score"] = avg_score
+    base["confidence"]   = avg_conf
+
+    # Deduplicate and merge catalysts / risks (up to 5 each)
+    def _merge_list(key: str) -> list:
+        seen: set = set()
+        merged: list = []
+        for r in responses:
+            for item in (r.get(key) or []):
+                if item and item not in seen:
+                    seen.add(item)
+                    merged.append(item)
+                    if len(merged) >= 5:
+                        return merged
+        return merged
+
+    if run_n == 1:
+        base["catalysts"] = _merge_list("catalysts")
+        base["risks"]     = _merge_list("risks")
+    else:
+        base["new_catalysts"] = _merge_list("new_catalysts")
+        base["new_risks"]     = _merge_list("new_risks")
+
+    base["timestamp"] = now_iso
+    base["price"]     = stock_data.get("price", 0)
+    return base
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # SECTION 4 — PROMPT FILLER
 # Substitutes all {variable} placeholders in a prompt template with real data.
 # ══════════════════════════════════════════════════════════════════════════════

@@ -57,6 +57,11 @@ HOLD — everything else
 | Configurable stock count (`NUM_STOCKS`) | ✅ |
 | Single-stock mode — skip discovery, analyse one ticker directly (`--stock`) | ✅ |
 | Telegram bot — trigger analysis on demand via `/ticker` command | ✅ |
+| Telegram whitelist — additional users can trigger the bot | ✅ |
+| `/get` monitoring loop — repeated analysis with baseline + delta prompts | ✅ |
+| Market-hours gating — skips analysis when exchange is closed | ✅ |
+| Session persistence — monitoring sessions survive bot restarts (SQLite) | ✅ |
+| `/stop`, `/status`, `/summary` companion commands | ✅ |
 
 ---
 
@@ -80,7 +85,10 @@ signal_mesh/
     ├── lib_env.py                    # .env loader (no external deps)
     ├── ask_gemini.py                 # CLI wrapper to test Gemini directly
     ├── ask_mistral.py                # CLI wrapper to test Mistral directly
-    ├── telegram_bot.py               # Interactive Telegram bot (/ticker command)
+    ├── telegram_bot.py               # Interactive Telegram bot (/ticker, /get, /stop, /status, /summary)
+    ├── lib_get_state.py              # SQLite session persistence for /get monitoring
+    ├── lib_market_hours.py           # Market-hours gating (NYSE, Euronext, XETRA)
+    ├── lib_telegram_format.py        # Telegram report/pulse/summary formatters
     ├── test_telegram.py              # Sends a sample Telegram notification
     └── outputs/                      # Timestamped run output files (gitignored)
 ```
@@ -327,6 +335,86 @@ Bot:  📊 Signal Mesh — NVDA
 ```
 
 The bot only responds to your configured `TELEGRAM_CHAT_ID` — messages from any other chat are silently ignored.
+
+You can also add a whitelist of additional chat IDs in `.env`:
+
+```
+TELEGRAM_WHITELIST=8756377036,1234567890
+```
+
+Whitelisted users can trigger analysis; results are sent to both the requester and the main chat (with a "requested by" tag).
+
+---
+
+## `/get` — Continuous Stock Monitoring
+
+`/get` starts a monitoring loop that re-analyses a stock at a regular interval, tracking how the signal evolves over time.
+
+### Command syntax
+
+```
+/get <STOCK> [agent] [runs=N] [interval=M] [mode=verbose|quiet]
+```
+
+| Parameter | Default | Description |
+|---|---|---|
+| `STOCK` | required | Ticker symbol (e.g. `NVDA`, `ASML.AS`) |
+| `agent` | `claude` | `claude` · `gemini` · `mistral` · `all` |
+| `runs=N` | `10` | Total number of analysis runs |
+| `interval=M` | `30` | Minutes between runs (min 5) |
+| `mode=verbose` | `quiet` | Send full report every run, or one-liner unless signal changes |
+
+### How it works
+
+- **Run 1** — baseline analysis with full market data. Full report always sent.
+- **Runs 2–N** — delta analysis: the LLM receives the baseline + previous run as context and focuses on *what has changed* (signal shift, price move, score drift).
+- **Quiet mode** (default) — sends a one-line pulse each run. Full report fires only when the signal changes or `|score_delta| >= 5`.
+- **Market hours gating** — skips analysis when the exchange is closed (weekends + outside trading hours). The bot waits until the next open; skipped intervals do not count against the total run count.
+- **Session persistence** — sessions survive bot restarts. Incomplete sessions are resumed automatically on startup.
+
+### Companion commands
+
+| Command | Description |
+|---|---|
+| `/stop [TICKER]` | Cancel the active session for TICKER (or all sessions) |
+| `/status` | List all active sessions with run progress |
+| `/summary [TICKER]` | Session summary: signal stability, flip count, price/score range |
+| `/help` | Full command reference |
+
+### Example
+
+```
+You:  /get NVDA 10 interval=15
+
+Bot:  📡 Monitoring NVDA — 10 runs every 15 min [Claude] (session: a1b2c3d4)
+      Run 1/10 starting now. Quiet mode — full report on signal change or score shift ≥5.
+
+Bot:  📊 NVDA — Run 1/10 (Baseline)
+      2026-05-22 09:30 UTC  ·  [Claude]
+      🟢 BUY  score: 68  conf: 72%  price: $131.45
+      Entry $131.45 | Stop $126.20 | Target $142.00 | R:R 2.0
+      ... (full report)
+
+      — 15 minutes later —
+
+Bot:  📡 NVDA 2/10  🟢BUY 69 (+1)  $132.10 (+0.5%)
+
+      — 15 minutes later, signal flips —
+
+Bot:  🔄 Signal flip: BUY → HOLD
+      📊 NVDA — Run 3/10 (Delta)
+      ... (full report with change analysis)
+
+      — after run 10 —
+
+Bot:  ✅ NVDA monitoring complete (10/10 runs)
+      📋 Summary:
+      Signal stability: 80% (8/10 BUY)
+      Signal flips: 2
+      Price range: $131.45 – $133.20
+      Score range: 66 – 71
+      Last signal: 🟢 BUY (score 70)
+```
 
 ---
 

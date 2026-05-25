@@ -2,6 +2,74 @@
 
 ---
 
+## 2026-05-22 — `/get` monitoring command + session persistence
+
+**Files added:** `int/bin/lib_get_state.py`, `int/bin/lib_market_hours.py`, `int/bin/lib_telegram_format.py`  
+**Files changed:** `int/bin/telegram_bot.py`, `int/bin/analysis_prompts.py`, `int/bin/signal_mesh_orchestrator.py`, `.gitignore`
+
+### What changed
+
+**1. `/get` command — continuous stock monitoring loop**
+- New bot command: `/get <STOCK> [agent] [runs=N] [interval=M] [mode=verbose|quiet]`
+- Runs repeated analysis on a single stock at a configurable interval (default 30 min, min 5 min).
+- Run #1 uses a baseline prompt; runs 2–N use a delta prompt that injects the baseline + previous run as context, so the LLM focuses on *what has changed*.
+- In quiet mode (default), only sends a one-line pulse per run unless the signal changes or `|score_delta| >= 5`.
+- In verbose mode, sends a full formatted report every run.
+- Sessions survive bot restarts — incomplete sessions are resumed from SQLite on startup.
+- Market-hours gating: skips analysis when the exchange is closed (weekends + outside trading window); waits until next open without counting the skipped interval against the total run count.
+
+**2. Companion commands**
+- `/stop [TICKER]` — cancel the active monitoring session (all sessions if no ticker given).
+- `/status` — list all active sessions with progress.
+- `/summary [TICKER]` — session summary: signal stability %, flip count, price range, score range, last signal.
+- `/help` — full command reference including ticker format guide and notes.
+
+**3. `lib_get_state.py` — SQLite session persistence**
+- Two tables: `get_sessions` (one row per session) and `get_runs` (one row per analysis run).
+- WAL mode for concurrent read/write safety.
+- Functions: `create_session`, `save_run`, `get_baseline`, `get_previous_run`, `mark_session_complete`, `cancel_session`, `list_active_sessions`, `get_session`, `get_session_runs`, `get_run_count`, `get_active_session_for_ticker`.
+- DB at `int/bin/get_state.db` (gitignored).
+
+**4. `lib_market_hours.py` — market-hours gating**
+- Exchange detection by ticker suffix: `.AS`/`.PA` → Euronext 08:00–16:30 UTC, `.DE` → XETRA 07:00–15:30 UTC, no suffix → US 13:30–20:00 UTC.
+- Optionally uses `pandas_market_calendars` for holiday-aware scheduling; falls back to UTC window + weekday check if not installed.
+- Public API: `is_market_open(ticker)`, `next_market_open(ticker)`.
+
+**5. `lib_telegram_format.py` — Telegram report formatting**
+- `format_report(parsed, run_n, total_runs, interval_min)` — full HTML report with signal-flip banner, score/confidence, delta vs baseline, trade levels (entry/stop/target/R:R), category breakdown with delta arrows, thesis, catalysts, risks, watch_for. Splits at 4096-char Telegram limit at the THESIS section.
+- `format_pulse(parsed, run_n, total_runs)` — one-liner for quiet mode.
+- `format_summary(session, runs)` — session summary table.
+
+**6. `analysis_prompts.py` additions**
+- `SINGLE_TICKER_BASELINE_PROMPT` — baseline prompt with full market data, fundamentals, sector/macro, and JSON output schema including trade levels and category breakdown.
+- `SINGLE_TICKER_DELTA_PROMPT` — delta prompt injecting baseline + previous run as context; extended schema adds `signal_changed_from_baseline`, `change_reason`, `score_delta_vs_baseline`, `price_delta_vs_baseline_pct`, per-category `delta` fields.
+- `build_baseline_prompt(ticker, data, total_runs, interval_min, currency)` — string builder.
+- `build_delta_prompt(ticker, data, run_n, baseline, previous, total_runs, interval_min)` — string builder; computes `elapsed_min` from baseline timestamp.
+
+**7. `signal_mesh_orchestrator.py` additions**
+- `fetch_single_ticker_data(ticker)` — richer yfinance fetch with OHLCV: day_change_pct, SMA20, MACD(12,26,9), Bollinger bands, ATR(14), today/avg volume, P/E (TTM + fwd), PEG, EPS/revenue growth, operating margin, D/E ratio, next earnings date.
+- `analyze_single_ticker(ticker, stock_data, agent_name, run_n, session_id, interval_min, total_runs)` — dispatches baseline or delta prompt, handles single/multi-agent (majority vote for signal, average scores, merged catalyst/risk lists).
+
+**8. Mistral error handling improved**
+- All error returns stripped of `"signal": "HOLD"` and `"factor_score": 50` so failed responses are correctly identified as SKIP.
+- Added `_parse_retry_delay(exc)` to extract retry delay from 429 responses (mirrors Gemini pattern).
+- Rate-limit detection uses both "rate limit" and "too many requests" patterns.
+
+**9. Telegram whitelist support**
+- `TELEGRAM_WHITELIST` env var added: comma-separated chat IDs that can trigger the bot.
+- Whitelisted users get results; `MAIN_CHAT` always receives a copy tagged "requested by @user".
+
+### Bot usage examples
+```
+/get NVDA 10 interval=15       — 10 runs every 15 min, quiet mode
+/get ASML.AS all runs=5 verbose — 5 runs with all agents, full report each time
+/stop NVDA                     — cancel NVDA session
+/status                        — list all active sessions
+/summary NVDA                  — session summary for NVDA
+```
+
+---
+
 ## 2026-05-23 — `--stock` flag + Telegram bot
 
 **Files added:** `int/bin/telegram_bot.py`

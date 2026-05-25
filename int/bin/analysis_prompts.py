@@ -1691,3 +1691,201 @@ TRADE_REPUBLIC_PROMPTS = {
     "tr_macro":       TR_MACRO_PROMPTS,
     "tr_quant":       TR_QUANT_PROMPTS,
 }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SINGLE-TICKER MONITORING PROMPTS  (/get command)
+# Run #1 is BASELINE; runs 2-N are DELTA comparisons against the baseline.
+# Both return ONLY valid JSON — no markdown fences, no prose.
+# Use .format() placeholders — NOT f-strings.
+# ══════════════════════════════════════════════════════════════════════════════
+
+SINGLE_TICKER_BASELINE_PROMPT = """You are a senior sell-side equity analyst with 15 years of swing-trading experience. Producing trade ideas for a private monitoring system. Not financial advice.
+
+CONTEXT
+Ticker: {ticker}  ·  Run: 1 of {total_runs}  ·  Interval: {interval_min} min
+As-of (UTC): {timestamp}  ·  Currency: {currency}
+Horizon: 5–15 trading days (swing)
+Mode: BASELINE — this is the first observation. Future runs will compare against this.
+
+MARKET DATA (yfinance — note: free tier is delayed ~15 min)
+Price: {price}  ·  Day change: {day_change_pct}%
+52w range: {low_52w} – {high_52w}
+RSI(14): {rsi}
+SMA20 / SMA50 / SMA200: {sma20} / {sma50} / {sma200}
+MACD (line / signal / hist): {macd_line} / {macd_signal} / {macd_hist}
+Bollinger (upper / mid / lower): {bb_upper} / {bb_mid} / {bb_lower}
+ATR(14): {atr}
+Volume: today {today_vol} vs 30d avg {avg_vol}
+
+FUNDAMENTALS
+P/E (ttm / fwd): {pe_ttm} / {pe_fwd}  ·  PEG: {peg}
+EPS YoY: {eps_growth}%  ·  Revenue YoY: {rev_growth}%
+Op margin: {op_margin}%  ·  Debt/Equity: {de_ratio}
+Next earnings: {next_earnings_date}
+
+SECTOR / MACRO
+Sector: {sector}  ·  Sector 1m: {sector_perf}%
+Fed funds trend: {rate_trend}  ·  VIX: {vix}
+
+REASONING RULES
+1. Think step-by-step internally. Output ONLY the final JSON.
+2. BUY requires confluence of ≥3: technical setup, fundamental support, sentiment tailwind, macro tailwind, R:R ≥ 2:1.
+3. SELL requires technical breakdown AND (fundamental weakness OR imminent catalyst risk).
+4. Default to HOLD when confluence is weak. Cash is a position.
+5. Calibrated confidence: stating 80 means you'd be right 8/10 times on this setup.
+6. If a field is missing/null, lower confidence — never invent values.
+7. Each category score MUST justify itself via the data above. No vibes.
+
+OUTPUT — return ONLY valid JSON, no markdown fences, no prose:
+
+{{"ticker":"{ticker}","run":1,"signal":"BUY","confidence":75,"factor_score":65,"entry":null,"stop_loss":null,"target":null,"risk_reward":null,"horizon_days":10,"scores":{{"technical":{{"score":65,"verdict":"verdict here"}},"fundamental":{{"score":60,"verdict":"verdict here"}},"sentiment":{{"score":55,"verdict":"verdict here"}},"macro":{{"score":60,"verdict":"verdict here"}},"quant":{{"score":65,"verdict":"verdict here"}}}},"catalysts":["catalyst 1"],"risks":["risk 1"],"thesis":"thesis here under 300 chars","watch_for":["watch item 1"]}}"""
+
+
+SINGLE_TICKER_DELTA_PROMPT = """You are a senior sell-side equity analyst monitoring {ticker} on a {interval_min}-minute cycle.
+
+CONTEXT
+Ticker: {ticker}  ·  Run: {run_n} of {total_runs}
+As-of (UTC): {timestamp}  ·  Elapsed since baseline: {elapsed_min} min
+Mode: DELTA — compare against baseline + previous run.
+
+BASELINE (run 1, {baseline_timestamp})
+Price: {baseline_price}  ·  Signal: {baseline_signal}  ·  Score: {baseline_score}
+Thesis: {baseline_thesis}
+Watch_for: {baseline_watch_for}
+
+PREVIOUS RUN (run {prev_run_n}, {prev_timestamp})
+Price: {prev_price}  ·  Signal: {prev_signal}  ·  Score: {prev_score}
+
+CURRENT MARKET DATA
+Price: {price}  ·  Day change: {day_change_pct}%
+52w range: {low_52w} – {high_52w}
+RSI(14): {rsi}
+SMA20 / SMA50 / SMA200: {sma20} / {sma50} / {sma200}
+MACD (line / signal / hist): {macd_line} / {macd_signal} / {macd_hist}
+Bollinger (upper / mid / lower): {bb_upper} / {bb_mid} / {bb_lower}
+ATR(14): {atr}
+Volume: today {today_vol} vs 30d avg {avg_vol}
+
+FUNDAMENTALS
+P/E (ttm / fwd): {pe_ttm} / {pe_fwd}  ·  PEG: {peg}
+EPS YoY: {eps_growth}%  ·  Revenue YoY: {rev_growth}%
+Op margin: {op_margin}%  ·  Debt/Equity: {de_ratio}
+Next earnings: {next_earnings_date}
+
+SECTOR / MACRO
+Sector: {sector}  ·  VIX: {vix}
+
+REASONING RULES (delta mode)
+1. Compare current data against baseline AND previous run.
+2. Only flip signal if confluence has genuinely changed — not on noise.
+3. A flip from HOLD→BUY or HOLD→SELL is a high-bar event. Justify it explicitly in change_reason.
+4. Same JSON contract as baseline, plus delta fields.
+5. Calibrated confidence rules still apply.
+
+OUTPUT — return ONLY valid JSON, no markdown fences, no prose:
+
+{{"ticker":"{ticker}","run":{run_n},"signal":"BUY","signal_changed_from_baseline":false,"signal_changed_from_previous":false,"change_reason":null,"confidence":75,"factor_score":65,"score_delta_vs_baseline":0,"price_delta_vs_baseline_pct":0.0,"entry":null,"stop_loss":null,"target":null,"risk_reward":null,"horizon_days":10,"scores":{{"technical":{{"score":65,"delta":0,"verdict":"verdict here"}},"fundamental":{{"score":60,"delta":0,"verdict":"verdict here"}},"sentiment":{{"score":55,"delta":0,"verdict":"verdict here"}},"macro":{{"score":60,"delta":0,"verdict":"verdict here"}},"quant":{{"score":65,"delta":0,"verdict":"verdict here"}}}},"new_catalysts":["catalyst that emerged since baseline"],"new_risks":["risk that emerged since baseline"],"thesis":"updated thesis under 300 chars","watch_for":["watch item for next run"]}}"""
+
+
+from datetime import datetime, timezone
+
+
+def build_baseline_prompt(ticker: str, data: dict, total_runs: int, interval_min: int, currency: str = "USD") -> str:
+    """Build a filled baseline prompt string for run #1."""
+    return SINGLE_TICKER_BASELINE_PROMPT.format(
+        ticker=ticker,
+        total_runs=total_runs,
+        interval_min=interval_min,
+        timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+        currency=currency,
+        price=data.get("price", "N/A"),
+        day_change_pct=data.get("day_change_pct", 0),
+        low_52w=data.get("low_52w", "N/A"),
+        high_52w=data.get("high_52w", "N/A"),
+        rsi=data.get("rsi", "N/A"),
+        sma20=data.get("sma20", "N/A"),
+        sma50=data.get("sma50", "N/A"),
+        sma200=data.get("sma200", "N/A"),
+        macd_line=data.get("macd_line", "N/A"),
+        macd_signal=data.get("macd_signal", "N/A"),
+        macd_hist=data.get("macd_hist", "N/A"),
+        bb_upper=data.get("bb_upper", "N/A"),
+        bb_mid=data.get("bb_mid", "N/A"),
+        bb_lower=data.get("bb_lower", "N/A"),
+        atr=data.get("atr", "N/A"),
+        today_vol=data.get("today_vol", "N/A"),
+        avg_vol=data.get("avg_vol", "N/A"),
+        pe_ttm=data.get("pe_ttm", "N/A"),
+        pe_fwd=data.get("pe_fwd", "N/A"),
+        peg=data.get("peg", "N/A"),
+        eps_growth=data.get("eps_growth", "N/A"),
+        rev_growth=data.get("rev_growth", "N/A"),
+        op_margin=data.get("op_margin", "N/A"),
+        de_ratio=data.get("de_ratio", "N/A"),
+        next_earnings_date=data.get("next_earnings_date", "N/A"),
+        sector=data.get("sector", "N/A"),
+        sector_perf=data.get("sector_perf", 0),
+        rate_trend=data.get("rate_trend", "hold"),
+        vix=data.get("vix", 18),
+    )
+
+
+def build_delta_prompt(ticker: str, data: dict, run_n: int, baseline: dict, previous: dict,
+                       total_runs: int, interval_min: int) -> str:
+    """Build a filled delta prompt string for runs 2-N."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    baseline_ts = baseline.get("timestamp", "")
+    try:
+        bl_dt = datetime.fromisoformat(baseline_ts.replace("Z", "+00:00"))
+        elapsed_min = int((now - bl_dt).total_seconds() / 60)
+    except Exception:
+        elapsed_min = (run_n - 1) * interval_min
+
+    return SINGLE_TICKER_DELTA_PROMPT.format(
+        ticker=ticker,
+        run_n=run_n,
+        total_runs=total_runs,
+        interval_min=interval_min,
+        timestamp=now.strftime("%Y-%m-%d %H:%M"),
+        elapsed_min=elapsed_min,
+        baseline_timestamp=baseline_ts[:16] if baseline_ts else "N/A",
+        baseline_price=baseline.get("price", "N/A"),
+        baseline_signal=baseline.get("signal", "HOLD"),
+        baseline_score=baseline.get("factor_score", 50),
+        baseline_thesis=baseline.get("thesis", "N/A")[:200],
+        baseline_watch_for=str(baseline.get("watch_for", []))[:200],
+        prev_run_n=run_n - 1,
+        prev_timestamp=previous.get("timestamp", "")[:16] if previous.get("timestamp") else "N/A",
+        prev_price=previous.get("price", "N/A"),
+        prev_signal=previous.get("signal", "HOLD"),
+        prev_score=previous.get("factor_score", 50),
+        price=data.get("price", "N/A"),
+        day_change_pct=data.get("day_change_pct", 0),
+        low_52w=data.get("low_52w", "N/A"),
+        high_52w=data.get("high_52w", "N/A"),
+        rsi=data.get("rsi", "N/A"),
+        sma20=data.get("sma20", "N/A"),
+        sma50=data.get("sma50", "N/A"),
+        sma200=data.get("sma200", "N/A"),
+        macd_line=data.get("macd_line", "N/A"),
+        macd_signal=data.get("macd_signal", "N/A"),
+        macd_hist=data.get("macd_hist", "N/A"),
+        bb_upper=data.get("bb_upper", "N/A"),
+        bb_mid=data.get("bb_mid", "N/A"),
+        bb_lower=data.get("bb_lower", "N/A"),
+        atr=data.get("atr", "N/A"),
+        today_vol=data.get("today_vol", "N/A"),
+        avg_vol=data.get("avg_vol", "N/A"),
+        pe_ttm=data.get("pe_ttm", "N/A"),
+        pe_fwd=data.get("pe_fwd", "N/A"),
+        peg=data.get("peg", "N/A"),
+        eps_growth=data.get("eps_growth", "N/A"),
+        rev_growth=data.get("rev_growth", "N/A"),
+        op_margin=data.get("op_margin", "N/A"),
+        de_ratio=data.get("de_ratio", "N/A"),
+        next_earnings_date=data.get("next_earnings_date", "N/A"),
+        sector=data.get("sector", "N/A"),
+        vix=data.get("vix", 18),
+    )

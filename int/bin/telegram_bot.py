@@ -25,6 +25,7 @@ The bot only accepts commands from the configured TELEGRAM_CHAT_ID for security.
 
 import json
 import os
+import sqlite3
 import sys
 import threading
 import time
@@ -41,6 +42,14 @@ from lib_env import load_dotenv
 
 load_dotenv()
 
+from lib_get_state import (
+    create_session, save_run, get_baseline, get_previous_run,
+    mark_session_complete, cancel_session, list_active_sessions,
+    get_session, get_session_runs, get_run_count, get_active_session_for_ticker,
+)
+from lib_market_hours import is_market_open, next_market_open
+from lib_telegram_format import format_report, format_pulse, format_summary
+
 BOT_TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 MAIN_CHAT    = os.environ.get("TELEGRAM_CHAT_ID",   "").strip()
 _raw_wl      = os.environ.get("TELEGRAM_WHITELIST", "").strip()
@@ -48,6 +57,8 @@ WHITELIST    = {c.strip() for c in _raw_wl.split(",") if c.strip()} if _raw_wl e
 ALLOWED_CHATS = {MAIN_CHAT} | WHITELIST   # all chat IDs permitted to use the bot
 VALID_AGENTS  = {"claude", "gemini", "mistral", "all"}
 POLL_TIMEOUT  = 30   # seconds for long-poll — Telegram holds the connection open
+
+_active_sessions: dict = {}   # session_id -> threading.Thread
 
 
 # ── Telegram API helpers ──────────────────────────────────────────────────────
@@ -163,6 +174,114 @@ def _run_analysis(requester_id: str, notify_chats: list, ticker: str, agent_name
     print(f"[Bot] Analysis complete for {ticker} ({agent_name}) — sent to {notify_chats}.")
 
 
+# ── /get monitoring loop ──────────────────────────────────────────────────────
+
+def _run_get_loop(
+    session_id: str,
+    requester_id: str,
+    notify_chats: list,
+    ticker: str,
+    agent_name: str,
+    total_runs: int,
+    interval_min: int,
+    quiet: bool,
+    start_run: int = 1,
+) -> None:
+    """Background thread that runs N analysis passes for a /get session."""
+    from signal_mesh_orchestrator import fetch_single_ticker_data, analyze_single_ticker
+    import datetime as _dt
+
+    run_n = start_run
+    while run_n <= total_runs:
+        # ── Cancellation check ────────────────────────────────────────────
+        sess = get_session(session_id)
+        if sess and sess["status"] == "cancelled":
+            broadcast(notify_chats, f"🛑 <b>{ticker}</b> monitoring cancelled at run {run_n}/{total_runs}.")
+            return
+
+        # ── Market hours gate ─────────────────────────────────────────────
+        if not is_market_open(ticker):
+            next_open  = next_market_open(ticker)
+            next_str   = next_open.strftime("%H:%M UTC")
+            broadcast(notify_chats, f"💤 <b>{ticker}</b> market closed. Pausing. Resuming at {next_str}")
+            now_utc    = _dt.datetime.now(_dt.timezone.utc)
+            sleep_secs = max(0.0, (next_open - now_utc).total_seconds())
+            # Sleep in up-to-1-hour chunks so we can re-check for cancellation
+            slept = 0.0
+            while slept < sleep_secs:
+                chunk = min(3600.0, sleep_secs - slept)
+                time.sleep(chunk)
+                slept += chunk
+                # Re-check cancellation after each chunk
+                sess = get_session(session_id)
+                if sess and sess["status"] == "cancelled":
+                    broadcast(notify_chats, f"🛑 <b>{ticker}</b> monitoring cancelled while market was closed.")
+                    return
+            # Do not increment run_n — retry the same run number
+            continue
+
+        # ── Fetch market data ─────────────────────────────────────────────
+        stock_data = fetch_single_ticker_data(ticker)
+        if "error" in stock_data:
+            broadcast(
+                notify_chats,
+                f"❌ <b>{ticker}</b> data fetch failed (run {run_n}): {stock_data['error']}",
+            )
+            if run_n < total_runs:
+                time.sleep(interval_min * 60)
+            run_n += 1
+            continue
+
+        # ── Run analysis ──────────────────────────────────────────────────
+        result = analyze_single_ticker(
+            ticker, stock_data, agent_name, run_n, session_id, interval_min, total_runs
+        )
+
+        if "error" in result and "signal" not in result:
+            broadcast(
+                notify_chats,
+                f"⚠️ <b>{ticker}</b> analysis error (run {run_n}): {result.get('error')}",
+            )
+        else:
+            # Persist to DB
+            save_run(session_id, run_n, result, stock_data.get("price", 0))
+
+            sig_changed = result.get("signal_changed_from_previous", False)
+            score_delta = abs(result.get("score_delta_vs_baseline", 0) or 0)
+            send_full   = (not quiet) or run_n == 1 or sig_changed or score_delta >= 5
+
+            by_tag = f"  <i>(req by {requester_id})</i>" if requester_id != MAIN_CHAT else ""
+
+            if send_full:
+                msgs = format_report(result, run_n, total_runs, interval_min)
+                for i, msg in enumerate(msgs):
+                    out = msg + by_tag if (by_tag and i == 0) else msg
+                    broadcast(notify_chats, out)
+            else:
+                broadcast(notify_chats, format_pulse(result, run_n, total_runs) + by_tag)
+
+        # ── Sleep before next run ─────────────────────────────────────────
+        run_n += 1
+        if run_n <= total_runs:
+            time.sleep(interval_min * 60)
+
+    # ── Session complete ──────────────────────────────────────────────────
+    mark_session_complete(session_id)
+    _active_sessions.pop(session_id, None)
+
+    runs    = get_session_runs(session_id)
+    session = get_session(session_id)
+    if runs and session:
+        run_dicts = [
+            {"signal": r["signal"], "price": r["price"], "factor_score": r["factor_score"]}
+            for r in runs
+        ]
+        broadcast(notify_chats, format_summary(session, run_dicts))
+
+    broadcast(notify_chats, f"✅ <b>{ticker}</b> monitoring complete ({total_runs} runs finished).")
+    print(f"[Bot] /get session {session_id} for {ticker} complete.")
+
+
 # ── Command handlers ──────────────────────────────────────────────────────────
 
 def handle_ticker(chat_id: str, args: list) -> None:
@@ -201,19 +320,166 @@ def handle_ticker(chat_id: str, args: list) -> None:
     thread.start()
 
 
+def handle_get(chat_id: str, args: list) -> None:
+    """Start a /get monitoring session for a ticker."""
+    if not args:
+        send(chat_id, "Usage: /get &lt;STOCK&gt; [agent] [runs] [interval] [verbose|quiet]\nExample: /get NVDA claude 100 20")
+        return
+
+    ticker       = args[0].upper()
+    agent_name   = "claude"
+    total_runs   = 1
+    interval_min = 20
+    quiet        = True
+
+    # Parse remaining args in order: agent, runs, interval, mode.
+    # Track how many integer args have been consumed so the first int → total_runs
+    # and the second int → interval_min.
+    remaining   = args[1:]
+    int_count   = 0
+    for val in remaining:
+        vl = val.lower()
+        if vl in VALID_AGENTS:
+            agent_name = vl
+        elif vl == "verbose":
+            quiet = False
+        elif vl == "quiet":
+            quiet = True
+        elif val.isdigit():
+            n = int(val)
+            if int_count == 0 and 1 <= n <= 500:
+                total_runs = n
+                int_count += 1
+            elif int_count == 1 and 5 <= n <= 240:
+                interval_min = n
+                int_count += 1
+
+    # Check for existing active session for this ticker
+    existing = get_active_session_for_ticker(ticker)
+    if existing:
+        send(chat_id,
+             f"⚠️ <b>{ticker}</b> already has an active session (<code>{existing['session_id']}</code>, "
+             f"started {existing['started_at'][:16]} UTC).\nUse /stop {ticker} first.")
+        return
+
+    session_id   = create_session(ticker, agent_name, total_runs, interval_min)
+    notify_chats = [chat_id]
+    if MAIN_CHAT and MAIN_CHAT != chat_id:
+        notify_chats.append(MAIN_CHAT)
+
+    mode_str    = "quiet" if quiet else "verbose"
+    agent_label = "Claude + Gemini + Mistral" if agent_name == "all" else agent_name.title()
+    duration_h  = round(total_runs * interval_min / 60, 1)
+
+    send(chat_id,
+         f"🔍 <b>Monitoring started</b>  ·  session: <code>{session_id}</code>\n"
+         f"Ticker: <b>{ticker}</b>  ·  Agent: [{agent_label}]\n"
+         f"Runs: {total_runs} × {interval_min} min = {duration_h}h  ·  Mode: {mode_str}\n"
+         f"<i>Use /stop {ticker} to cancel early.</i>")
+
+    thread = threading.Thread(
+        target=_run_get_loop,
+        args=(session_id, chat_id, notify_chats, ticker, agent_name, total_runs, interval_min, quiet),
+        name=f"get-{ticker}-{session_id}",
+        daemon=True,
+    )
+    _active_sessions[session_id] = thread
+    thread.start()
+
+
+def handle_stop(chat_id: str, args: list) -> None:
+    """Cancel an active /get session."""
+    if not args:
+        send(chat_id, "Usage: /stop &lt;STOCK&gt;")
+        return
+    ticker  = args[0].upper()
+    session = get_active_session_for_ticker(ticker)
+    if not session:
+        send(chat_id, f"No active session for <b>{ticker}</b>.")
+        return
+    cancel_session(session["session_id"])
+    completed = get_run_count(session["session_id"])
+    send(chat_id,
+         f"🛑 Cancelling <b>{ticker}</b> session <code>{session['session_id']}</code>.\n"
+         f"Completed {completed}/{session['total_runs']} runs so far.")
+
+
+def handle_status(chat_id: str, args: list) -> None:
+    """List all currently active /get sessions."""
+    sessions = list_active_sessions()
+    if not sessions:
+        send(chat_id, "No active monitoring sessions.")
+        return
+    lines = ["<b>Active Sessions:</b>"]
+    for s in sessions:
+        completed = get_run_count(s["session_id"])
+        remaining = s["total_runs"] - completed
+        next_min  = s["interval_min"]
+        lines.append(
+            f"  <b>{s['ticker']}</b> · <code>{s['session_id']}</code> · "
+            f"run {completed}/{s['total_runs']} · "
+            f"~{remaining * next_min}min left"
+        )
+    send(chat_id, "\n".join(lines))
+
+
+def handle_summary(chat_id: str, args: list) -> None:
+    """Show a summary of the most recent session for a ticker."""
+    if not args:
+        send(chat_id, "Usage: /summary &lt;STOCK&gt;")
+        return
+    ticker = args[0].upper()
+    db     = Path(__file__).resolve().parent / "get_state.db"
+    with sqlite3.connect(str(db)) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM get_sessions WHERE ticker=? ORDER BY started_at DESC LIMIT 1",
+            (ticker,),
+        ).fetchone()
+    if not row:
+        send(chat_id, f"No sessions found for <b>{ticker}</b>.")
+        return
+    session   = dict(row)
+    runs      = get_session_runs(session["session_id"])
+    run_dicts = [{"signal": r["signal"], "price": r["price"], "factor_score": r["factor_score"]} for r in runs]
+    send(chat_id, format_summary(session, run_dicts))
+
+
 HELP_TEXT = (
-    "<b>Signal Mesh Bot</b>\n\n"
-    "<b>Commands:</b>\n"
-    "  /ticker &lt;STOCK&gt;          — analyse with Claude (default)\n"
-    "  /ticker &lt;STOCK&gt; all       — analyse with all 3 agents\n"
-    "  /ticker &lt;STOCK&gt; gemini    — analyse with Gemini only\n"
-    "  /ticker &lt;STOCK&gt; mistral   — analyse with Mistral only\n"
-    "  /ticker &lt;STOCK&gt; claude    — analyse with Claude only\n\n"
-    "<b>Ticker format (yfinance):</b>\n"
-    "  US stocks  →  NVDA, AAPL, MSFT\n"
-    "  EU stocks  →  ASML.AS, SAP.DE, MC.PA\n"
-    "  ETFs       →  SPY, QQQ, IWDA.AS\n\n"
-    "<i>Analysis takes 2–5 minutes. You'll get a reply when it's done.</i>"
+    "<b>🤖 Signal Mesh Bot — Commands</b>\n\n"
+    "<b>📊 ANALYSIS</b>\n"
+    "/ticker &lt;STOCK&gt; [agent]\n"
+    "  One-shot analysis.\n"
+    "  Agents: claude (default) · gemini · mistral · all\n"
+    "  Example: /ticker NVDA all\n\n"
+    "/get &lt;STOCK&gt; [agent] [runs] [interval] [mode]\n"
+    "  Monitor a stock over time with full reports.\n"
+    "  agent:    claude · gemini · mistral · all\n"
+    "  runs:     1–500  (default 1)\n"
+    "  interval: 5–240 min  (default 20)\n"
+    "  mode:     verbose · quiet  (default quiet)\n\n"
+    "  Examples:\n"
+    "  /get NVDA\n"
+    "  /get ASML.AS gemini\n"
+    "  /get NVDA claude 100 20\n"
+    "  /get NVDA all 50 30 verbose\n\n"
+    "<b>🛑 CONTROL</b>\n"
+    "/stop &lt;STOCK&gt;   — cancel active monitoring\n"
+    "/status          — list all running sessions\n"
+    "/summary &lt;STOCK&gt; — summary of last session\n\n"
+    "<b>ℹ️ INFO</b>\n"
+    "/help — this message\n\n"
+    "<b>📌 TICKER FORMAT</b>\n"
+    "US:        NVDA · AAPL · MSFT\n"
+    "Amsterdam: ASML.AS · HEIA.AS\n"
+    "Frankfurt: SAP.DE · BMW.DE\n"
+    "Paris:     MC.PA · AIR.PA\n\n"
+    "<b>⚙️ NOTES</b>\n"
+    "- yfinance data is delayed ~15 min (free tier)\n"
+    "- Monitoring pauses when market is closed\n"
+    "- Quiet mode: pulse unless signal flips or score moves ≥5\n"
+    "- Sessions survive bot restarts (SQLite-backed)\n\n"
+    "<i>⚠️ Research tool only. Not financial advice.</i>"
 )
 
 
@@ -232,6 +498,28 @@ def main() -> None:
     print(f"[Bot] Whitelist  : {', '.join(WHITELIST) if WHITELIST else '(none)'}")
     print("[Bot] Send /ticker <STOCK> [agent] to trigger analysis.")
     print("[Bot] Press Ctrl+C to stop.\n")
+
+    # Resume any sessions that were active when the bot last stopped
+    interrupted = list_active_sessions()
+    if interrupted:
+        print(f"[Bot] Resuming {len(interrupted)} interrupted session(s)...")
+        for s in interrupted:
+            start_run = get_run_count(s["session_id"]) + 1
+            if start_run > s["total_runs"]:
+                mark_session_complete(s["session_id"])
+                continue
+            notify_chats = [MAIN_CHAT] if MAIN_CHAT else []
+            t = threading.Thread(
+                target=_run_get_loop,
+                args=(s["session_id"], MAIN_CHAT, notify_chats,
+                      s["ticker"], s["agent"], s["total_runs"],
+                      s["interval_min"], True, start_run),
+                name=f"get-{s['ticker']}-{s['session_id']}",
+                daemon=True,
+            )
+            _active_sessions[s["session_id"]] = t
+            t.start()
+            print(f"[Bot]   Resumed {s['ticker']} session {s['session_id']} from run {start_run}")
 
     offset = 0
     while True:
@@ -259,6 +547,14 @@ def main() -> None:
 
             if command == "/ticker":
                 handle_ticker(chat_id, args)
+            elif command == "/get":
+                handle_get(chat_id, args)
+            elif command == "/stop":
+                handle_stop(chat_id, args)
+            elif command == "/status":
+                handle_status(chat_id, args)
+            elif command == "/summary":
+                handle_summary(chat_id, args)
             elif command in ("/start", "/help"):
                 send(chat_id, HELP_TEXT)
             else:
