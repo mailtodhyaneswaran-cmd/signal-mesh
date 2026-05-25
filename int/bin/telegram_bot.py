@@ -122,7 +122,7 @@ def _run_analysis(requester_id: str, notify_chats: list, ticker: str, agent_name
 
     # Run analysis
     try:
-        result = run_all_prompts_for_ticker(ticker, stock_data, agents=agents, euro=False)
+        result = run_all_prompts_for_ticker(ticker, stock_data, agents=agents, euro=False, threaded=len(agents) > 1)
     except Exception as e:
         broadcast(notify_chats, f"❌ Analysis failed for <b>{ticker}</b>: {e}")
         return
