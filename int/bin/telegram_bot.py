@@ -41,10 +41,13 @@ from lib_env import load_dotenv
 
 load_dotenv()
 
-BOT_TOKEN      = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-ALLOWED_CHAT   = os.environ.get("TELEGRAM_CHAT_ID",   "").strip()
-VALID_AGENTS   = {"claude", "gemini", "mistral", "all"}
-POLL_TIMEOUT   = 30   # seconds for long-poll — Telegram holds the connection open
+BOT_TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+MAIN_CHAT    = os.environ.get("TELEGRAM_CHAT_ID",   "").strip()
+_raw_wl      = os.environ.get("TELEGRAM_WHITELIST", "").strip()
+WHITELIST    = {c.strip() for c in _raw_wl.split(",") if c.strip()} if _raw_wl else set()
+ALLOWED_CHATS = {MAIN_CHAT} | WHITELIST   # all chat IDs permitted to use the bot
+VALID_AGENTS  = {"claude", "gemini", "mistral", "all"}
+POLL_TIMEOUT  = 30   # seconds for long-poll — Telegram holds the connection open
 
 
 # ── Telegram API helpers ──────────────────────────────────────────────────────
@@ -61,7 +64,12 @@ def send(chat_id: str, text: str) -> None:
     try:
         _api("sendMessage", {"chat_id": chat_id, "text": text, "parse_mode": "HTML"})
     except Exception as e:
-        print(f"[Bot] send failed: {e}")
+        print(f"[Bot] send failed to {chat_id}: {e}")
+
+
+def broadcast(chat_ids: list, text: str) -> None:
+    for cid in chat_ids:
+        send(cid, text)
 
 
 def get_updates(offset: int) -> list:
@@ -78,7 +86,7 @@ def get_updates(offset: int) -> list:
 
 # ── Analysis runner (called from a background thread) ────────────────────────
 
-def _run_analysis(chat_id: str, ticker: str, agent_name: str) -> None:
+def _run_analysis(requester_id: str, notify_chats: list, ticker: str, agent_name: str) -> None:
     from lib_agents_claude import ClaudeAgent
     from lib_agents_gemini import GeminiAgent
     from lib_agents_mistral import MistralAgent
@@ -95,26 +103,28 @@ def _run_analysis(chat_id: str, ticker: str, agent_name: str) -> None:
         agents = [ClaudeAgent(verbose=False)]
 
     agents_label = " + ".join(a.name for a in agents)
+    by_tag = f"  <i>(requested by {requester_id})</i>" if requester_id != MAIN_CHAT else ""
 
     # Fetch market data
-    send(chat_id, f"⏳ Fetching market data for <b>{ticker}</b>...")
+    broadcast(notify_chats, f"⏳ Fetching market data for <b>{ticker}</b>...{by_tag}")
     stock_data = fetch_stock_data(ticker)
     if "error" in stock_data:
-        send(chat_id, f"❌ Could not fetch data for <b>{ticker}</b>: {stock_data['error']}\n\n"
-                      f"<i>Check the ticker symbol — EU stocks need an exchange suffix, e.g. ASML.AS, SAP.DE</i>")
+        broadcast(notify_chats,
+                  f"❌ Could not fetch data for <b>{ticker}</b>: {stock_data['error']}\n\n"
+                  f"<i>Check the ticker symbol — EU stocks need an exchange suffix, e.g. ASML.AS, SAP.DE</i>")
         return
 
-    send(chat_id,
-         f"📈 Data fetched for <b>{ticker}</b>:\n"
-         f"  Price: ${stock_data['price']}  ·  RSI: {stock_data['rsi']}  ·  Vol: {stock_data['vol_trend']}\n\n"
-         f"Running 25 prompts with [{agents_label}]...\n"
-         f"<i>This takes a few minutes — sit tight.</i>")
+    broadcast(notify_chats,
+              f"📈 Data fetched for <b>{ticker}</b>:{by_tag}\n"
+              f"  Price: ${stock_data['price']}  ·  RSI: {stock_data['rsi']}  ·  Vol: {stock_data['vol_trend']}\n\n"
+              f"Running 25 prompts with [{agents_label}]...\n"
+              f"<i>This takes a few minutes — sit tight.</i>")
 
     # Run analysis
     try:
         result = run_all_prompts_for_ticker(ticker, stock_data, agents=agents, euro=False)
     except Exception as e:
-        send(chat_id, f"❌ Analysis failed for <b>{ticker}</b>: {e}")
+        broadcast(notify_chats, f"❌ Analysis failed for <b>{ticker}</b>: {e}")
         return
 
     # Format result
@@ -138,7 +148,7 @@ def _run_analysis(chat_id: str, ticker: str, agent_name: str) -> None:
 
     lines = [
         f"<b>📊 Signal Mesh — {ticker}</b>",
-        f"{now}  ·  [{agents_label}]",
+        f"{now}  ·  [{agents_label}]{by_tag}",
         "",
         f"{emoji} <b>{sig}</b>  score: {score:.1f}",
         f"Votes: {result['buy_count']} BUY  ·  {result['sell_count']} SELL  ·  {result['hold_count']} HOLD  ({total} total)",
@@ -149,8 +159,8 @@ def _run_analysis(chat_id: str, ticker: str, agent_name: str) -> None:
     if reliability_lines:
         lines += ["", "<b>Agent Reliability:</b>"] + reliability_lines
 
-    send(chat_id, "\n".join(lines))
-    print(f"[Bot] Analysis complete for {ticker} ({agent_name}) — result sent to chat.")
+    broadcast(notify_chats, "\n".join(lines))
+    print(f"[Bot] Analysis complete for {ticker} ({agent_name}) — sent to {notify_chats}.")
 
 
 # ── Command handlers ──────────────────────────────────────────────────────────
@@ -177,9 +187,14 @@ def handle_ticker(chat_id: str, args: list) -> None:
     label = "Claude + Gemini + Mistral" if agent_name == "all" else agent_name.title()
     send(chat_id, f"🔍 Starting analysis for <b>{ticker}</b> with [{label}]...")
 
+    # Build recipient list: requester + main chat (deduplicated, order preserved)
+    notify_chats = [chat_id]
+    if MAIN_CHAT and MAIN_CHAT != chat_id:
+        notify_chats.append(MAIN_CHAT)
+
     thread = threading.Thread(
         target=_run_analysis,
-        args=(chat_id, ticker, agent_name),
+        args=(chat_id, notify_chats, ticker, agent_name),
         name=f"analysis-{ticker}",
         daemon=True,
     )
@@ -208,12 +223,13 @@ def main() -> None:
     if not BOT_TOKEN:
         print("Error: TELEGRAM_BOT_TOKEN not set in .env", file=sys.stderr)
         sys.exit(1)
-    if not ALLOWED_CHAT:
+    if not MAIN_CHAT:
         print("Error: TELEGRAM_CHAT_ID not set in .env", file=sys.stderr)
         sys.exit(1)
 
     print("[Bot] Signal Mesh Telegram bot started.")
-    print(f"[Bot] Accepting commands from chat_id={ALLOWED_CHAT}")
+    print(f"[Bot] Main chat  : {MAIN_CHAT}")
+    print(f"[Bot] Whitelist  : {', '.join(WHITELIST) if WHITELIST else '(none)'}")
     print("[Bot] Send /ticker <STOCK> [agent] to trigger analysis.")
     print("[Bot] Press Ctrl+C to stop.\n")
 
@@ -230,8 +246,8 @@ def main() -> None:
             if not text or not chat_id:
                 continue
 
-            # Security: only respond to the configured chat
-            if chat_id != ALLOWED_CHAT:
+            # Security: only respond to main chat + whitelisted IDs
+            if chat_id not in ALLOWED_CHATS:
                 print(f"[Bot] Ignored message from unauthorised chat_id={chat_id}")
                 continue
 
