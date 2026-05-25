@@ -90,7 +90,7 @@ def _run_analysis(requester_id: str, notify_chats: list, ticker: str, agent_name
     from lib_agents_claude import ClaudeAgent
     from lib_agents_gemini import GeminiAgent
     from lib_agents_mistral import MistralAgent
-    from signal_mesh_orchestrator import fetch_stock_data, run_all_prompts_for_ticker
+    from signal_mesh_orchestrator import fetch_stock_data, run_bulk_prompts_for_ticker
 
     # Build agent list
     if agent_name == "all":
@@ -117,12 +117,12 @@ def _run_analysis(requester_id: str, notify_chats: list, ticker: str, agent_name
     broadcast(notify_chats,
               f"📈 Data fetched for <b>{ticker}</b>:{by_tag}\n"
               f"  Price: ${stock_data['price']}  ·  RSI: {stock_data['rsi']}  ·  Vol: {stock_data['vol_trend']}\n\n"
-              f"Running 25 prompts with [{agents_label}]...\n"
+              f"Running bulk analysis with [{agents_label}]...\n"
               f"<i>This takes a few minutes — sit tight.</i>")
 
     # Run analysis
     try:
-        result = run_all_prompts_for_ticker(ticker, stock_data, agents=agents, euro=False, threaded=len(agents) > 1)
+        result = run_bulk_prompts_for_ticker(ticker, stock_data, agents=agents, euro=False)
     except Exception as e:
         broadcast(notify_chats, f"❌ Analysis failed for <b>{ticker}</b>: {e}")
         return
