@@ -2,6 +2,72 @@
 
 ---
 
+## 2026-05-29 — IBKR integration + `/get2` automated trading
+
+**Files added:** `int/bin/lib_ibkr.py`, `int/bin/test_ibkr_endpoint.py`  
+**Files changed:** `int/bin/telegram_bot.py`, `int/bin/lib_get_state.py`, `.env`
+
+### What changed
+
+**1. `lib_ibkr.py` — Interactive Brokers API client**
+- Uses `ib_insync` (pip install ib_insync) — no API keys needed. Authentication happens by logging into IB Gateway or TWS locally; Python connects via TCP socket.
+- Reads IBKR_HOST (127.0.0.1), IBKR_PORT (4002 paper / 4001 live), IBKR_CLIENT_ID, IBKR_PAPER, IBKR_ACCOUNT from .env.
+- Thread-safe: single IB instance, `threading.Lock` on order placement.
+- Exchange suffix mapping: `.AS` → AEB/EUR, `.DE` → IBIS/EUR, `.PA` → SBF/EUR, bare ticker → SMART/USD.
+- `IbkrClient` methods: connect/disconnect/is_connected, account_summary, get_cash_balance, get_all_positions, get_position, last_price, buy_dollars (cashQty fractional for US; whole-share floor for EU), sell_position (reads current qty → MarketOrder SELL), get_order_status, get_recent_executions.
+- Module-level `get_client()` singleton + `IBKR_AVAILABLE` flag.
+
+**2. `test_ibkr_endpoint.py` — 6-section integration test**
+- Run: `python int/bin/test_ibkr_endpoint.py`
+- Tests: connection, account summary, positions, AAPL price, recent executions, paper limit order (placed far from market, then cancelled).
+- Each section wrapped in try/except; prints `[PASS]` / `[FAIL]` / `[SKIP]`. Final X/6 summary.
+
+**3. `/get2` command — automated trading loop**
+- Syntax: `/get2 <STOCK> [agent] <runs> <interval> <budget>`
+- Like `/get` but executes real IBKR trades on signal:
+  - First BUY signal while no position → `buy_dollars(ticker, budget)`
+  - SELL signal while long → `sell_position(ticker)`, reports P&L
+  - BUY/HOLD while long → hold notifications
+  - Any signal while waiting → quiet pulse
+  - Session end while long → auto-liquidation
+  - `/stop` while long → cancel + liquidate
+- Position state persisted in SQLite (`get2_meta` table), survives restarts.
+- Trade records in `get2_trades` table: action, qty, fill_price, ibkr_order_id, P&L.
+
+**4. `/portfolio` and `/trades` commands**
+- `/portfolio` — shows IBKR account cash, net liquidation, buying power, unrealized P&L, and per-position table.
+- `/trades <TICKER>` — trade history for the most recent `/get2` session for that ticker.
+
+**5. New SQLite tables in `lib_get_state.py`**
+- `get2_meta` — budget, currency, position_status (none|long), position_qty, position_buy_price per session.
+- `get2_trades` — per-trade records with IBKR order ID, status, P&L.
+
+**6. `.env` additions**
+- IBKR_HOST, IBKR_PORT, IBKR_CLIENT_ID, IBKR_ACCOUNT, IBKR_PAPER with inline setup guide.
+
+### Setup
+```
+pip install ib_insync
+
+# 1. Download IB Gateway: ibkr.com/ibgateway
+# 2. Log in with paper account credentials
+# 3. Configure > Settings > API > Settings:
+#    ✓ Enable ActiveX and Socket Clients
+#    ✗ Read-Only API
+#    Port: 4002  |  Trusted IP: 127.0.0.1
+# 4. Set IBKR_PORT=4002 and IBKR_PAPER=true in .env
+# 5. Test: python int/bin/test_ibkr_endpoint.py
+```
+
+### /get2 usage
+```
+/get2 NVDA claude 10 20 50   — 10 runs × 20 min, $50 budget
+/portfolio                   — IBKR account snapshot
+/trades NVDA                 — trade history for NVDA
+```
+
+---
+
 ## 2026-05-22 — `/get` monitoring command + session persistence
 
 **Files added:** `int/bin/lib_get_state.py`, `int/bin/lib_market_hours.py`, `int/bin/lib_telegram_format.py`  

@@ -42,13 +42,22 @@ from lib_env import load_dotenv
 
 load_dotenv()
 
+import html
 from lib_get_state import (
     create_session, save_run, get_baseline, get_previous_run,
     mark_session_complete, cancel_session, list_active_sessions,
     get_session, get_session_runs, get_run_count, get_active_session_for_ticker,
+    create_get2_meta, update_get2_position, get_get2_meta,
+    record_get2_trade, get_get2_trades, list_active_get2_sessions,
+    get_active_get2_session_for_ticker,
 )
 from lib_market_hours import is_market_open, next_market_open
 from lib_telegram_format import format_report, format_pulse, format_summary
+try:
+    from lib_ibkr import get_client as get_ibkr_client, IBKR_AVAILABLE
+except ImportError:
+    IBKR_AVAILABLE = False
+    get_ibkr_client = None
 
 BOT_TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 MAIN_CHAT    = os.environ.get("TELEGRAM_CHAT_ID",   "").strip()
@@ -282,6 +291,213 @@ def _run_get_loop(
     print(f"[Bot] /get session {session_id} for {ticker} complete.")
 
 
+# ── /get2 automated trading loop ─────────────────────────────────────────────
+
+def _run_get2_loop(
+    session_id: str,
+    requester_id: str,
+    notify_chats: list,
+    ticker: str,
+    agent_name: str,
+    total_runs: int,
+    interval_min: int,
+    budget: float,
+    start_run: int = 1,
+) -> None:
+    from signal_mesh_orchestrator import fetch_single_ticker_data, analyze_single_ticker
+    import datetime as _dt
+
+    if not IBKR_AVAILABLE or get_ibkr_client is None:
+        broadcast(notify_chats, "⚠️ IBKR not available. Run: pip install ib_insync")
+        cancel_session(session_id)
+        return
+
+    ibkr = get_ibkr_client()
+    if not ibkr.is_connected():
+        if not ibkr.connect():
+            broadcast(notify_chats, f"❌ <b>{ticker}</b> /get2 aborted — could not connect to IBKR. Start IB Gateway first.")
+            cancel_session(session_id)
+            return
+
+    meta = get_get2_meta(session_id)
+    position_status   = meta["position_status"]   if meta else "none"
+    position_qty      = meta["position_qty"]      if meta else 0.0
+    position_buy_price = meta["position_buy_price"] if meta else 0.0
+
+    run_n = start_run
+    while run_n <= total_runs:
+        sess = get_session(session_id)
+        if sess and sess["status"] == "cancelled":
+            if position_status == "long":
+                try:
+                    res = ibkr.sell_position(ticker)
+                    pnl = res.get("pnl", 0.0)
+                    record_get2_trade(
+                        session_id, run_n, "SELL", ticker,
+                        res.get("quantity", 0), res.get("fill_price", 0) * res.get("quantity", 0),
+                        res.get("fill_price", 0), res.get("order_id"), res.get("status"), pnl,
+                    )
+                    update_get2_position(session_id, "none", 0, 0)
+                    broadcast(notify_chats,
+                              f"🛑 <b>{ticker}</b> /get2 cancelled — liquidated position.\n"
+                              f"Fill: ${res.get('fill_price', 0):.2f}  ·  P&amp;L: ${pnl:.2f}")
+                except Exception as e:
+                    broadcast(notify_chats,
+                              f"🛑 <b>{ticker}</b> /get2 cancelled — sell failed: {html.escape(str(e))}\n"
+                              f"<b>Close position manually in IBKR.</b>")
+            else:
+                broadcast(notify_chats, f"🛑 <b>{ticker}</b> /get2 cancelled at run {run_n}/{total_runs}.")
+            return
+
+        if not is_market_open(ticker):
+            next_open = next_market_open(ticker)
+            next_str  = next_open.strftime("%H:%M UTC")
+            broadcast(notify_chats, f"💤 <b>{ticker}</b> market closed. Pausing. Resuming at {next_str}")
+            now_utc    = _dt.datetime.now(_dt.timezone.utc)
+            sleep_secs = max(0.0, (next_open - now_utc).total_seconds())
+            slept = 0.0
+            while slept < sleep_secs:
+                chunk = min(3600.0, sleep_secs - slept)
+                time.sleep(chunk)
+                slept += chunk
+                sess = get_session(session_id)
+                if sess and sess["status"] == "cancelled":
+                    broadcast(notify_chats, f"🛑 <b>{ticker}</b> /get2 cancelled while market was closed.")
+                    return
+            continue
+
+        stock_data = fetch_single_ticker_data(ticker)
+        if "error" in stock_data:
+            broadcast(notify_chats,
+                      f"❌ <b>{ticker}</b> data fetch failed (run {run_n}): {html.escape(str(stock_data['error']))}")
+            run_n += 1
+            if run_n <= total_runs:
+                time.sleep(interval_min * 60)
+            continue
+
+        result = analyze_single_ticker(ticker, stock_data, agent_name, run_n, session_id, interval_min, total_runs)
+        price  = float(stock_data.get("price", 0))
+        signal = result.get("signal", "HOLD")
+        score  = result.get("factor_score", 50)
+
+        save_run(session_id, run_n, result, price)
+
+        if signal == "BUY" and position_status == "none":
+            try:
+                res = ibkr.buy_dollars(ticker, budget)
+                if res.get("status") in ("Filled", "Submitted", "PreSubmitted"):
+                    qty        = float(res.get("quantity", 0))
+                    fill_price = float(res.get("fill_price", 0))
+                    order_id   = res.get("order_id")
+                    record_get2_trade(
+                        session_id, run_n, "BUY", ticker,
+                        qty, budget, fill_price, order_id, res.get("status"), 0.0,
+                    )
+                    update_get2_position(session_id, "long", qty, fill_price)
+                    position_status    = "long"
+                    position_qty       = qty
+                    position_buy_price = fill_price
+                    broadcast(notify_chats,
+                              f"🟢 <b>BUY executed</b>  ·  {ticker}  run {run_n}/{total_runs}\n"
+                              f"Qty: {qty}  ·  Fill: ${fill_price:.2f}  ·  Order: <code>{order_id}</code>")
+                else:
+                    broadcast(notify_chats,
+                              f"⚠️ <b>{ticker}</b> BUY order status: {html.escape(str(res.get('status', 'unknown')))}\n"
+                              f"Position not updated. Check IBKR.")
+            except Exception as e:
+                broadcast(notify_chats,
+                          f"❌ <b>{ticker}</b> BUY failed (run {run_n}): {html.escape(str(e))}")
+
+        elif signal == "SELL" and position_status == "long":
+            try:
+                res = ibkr.sell_position(ticker)
+                if res.get("status") in ("Filled", "Submitted", "PreSubmitted"):
+                    fill_price = float(res.get("fill_price", 0))
+                    qty        = float(res.get("quantity", 0))
+                    pnl        = float(res.get("pnl", 0))
+                    order_id   = res.get("order_id")
+                    record_get2_trade(
+                        session_id, run_n, "SELL", ticker,
+                        qty, qty * fill_price, fill_price, order_id, res.get("status"), pnl,
+                    )
+                    update_get2_position(session_id, "none", 0, 0)
+                    position_status    = "none"
+                    position_qty       = 0.0
+                    position_buy_price = 0.0
+                    pnl_sign = "+" if pnl >= 0 else ""
+                    broadcast(notify_chats,
+                              f"🔴 <b>SELL executed</b>  ·  {ticker}  run {run_n}/{total_runs}\n"
+                              f"Qty: {qty}  ·  Fill: ${fill_price:.2f}  ·  P&amp;L: {pnl_sign}${pnl:.2f}  ·  Order: <code>{order_id}</code>")
+                else:
+                    broadcast(notify_chats,
+                              f"⚠️ <b>{ticker}</b> SELL order status: {html.escape(str(res.get('status', 'unknown')))}\n"
+                              f"<b>Close position manually in IBKR.</b>")
+            except Exception as e:
+                broadcast(notify_chats,
+                          f"❌ <b>{ticker}</b> SELL failed (run {run_n}): {html.escape(str(e))}\n"
+                          f"<b>Close position manually in IBKR.</b>")
+
+        elif signal == "BUY" and position_status == "long":
+            pct = ((price - position_buy_price) / position_buy_price * 100) if position_buy_price else 0
+            pct_sign = "+" if pct >= 0 else ""
+            broadcast(notify_chats,
+                      f"🟢 BUY confirmed — holding position  ·  {ticker}  run {run_n}/{total_runs}\n"
+                      f"Current: ${price:.2f}  ·  Bought at: ${position_buy_price:.2f}  ·  {pct_sign}{pct:.1f}%")
+
+        elif signal == "HOLD" and position_status == "long":
+            pct = ((price - position_buy_price) / position_buy_price * 100) if position_buy_price else 0
+            pct_sign = "+" if pct >= 0 else ""
+            broadcast(notify_chats,
+                      f"🟡 HOLD — keeping position  ·  {ticker}  run {run_n}/{total_runs}\n"
+                      f"Current: ${price:.2f}  ·  Bought at: ${position_buy_price:.2f}  ·  {pct_sign}{pct:.1f}%")
+
+        else:
+            broadcast(notify_chats,
+                      f"📡 {ticker}  {run_n}/{total_runs}  {signal}  {score}  ${price:.2f}  (waiting for BUY)")
+
+        run_n += 1
+        if run_n <= total_runs:
+            time.sleep(interval_min * 60)
+
+    if position_status == "long":
+        try:
+            res = ibkr.sell_position(ticker)
+            fill_price = float(res.get("fill_price", 0))
+            qty        = float(res.get("quantity", 0))
+            pnl        = float(res.get("pnl", 0))
+            order_id   = res.get("order_id")
+            record_get2_trade(
+                session_id, total_runs, "SELL", ticker,
+                qty, qty * fill_price, fill_price, order_id, res.get("status"), pnl,
+            )
+            update_get2_position(session_id, "none", 0, 0)
+            pnl_sign = "+" if pnl >= 0 else ""
+            broadcast(notify_chats,
+                      f"🔴 <b>Session end — auto-liquidated</b>  ·  {ticker}\n"
+                      f"Fill: ${fill_price:.2f}  ·  P&amp;L: {pnl_sign}${pnl:.2f}")
+        except Exception as e:
+            broadcast(notify_chats,
+                      f"⚠️ <b>{ticker}</b> end-of-session sell failed: {html.escape(str(e))}\n"
+                      f"<b>Close position manually in IBKR.</b>")
+
+    mark_session_complete(session_id)
+    _active_sessions.pop(session_id, None)
+
+    trades = get_get2_trades(session_id)
+    buys   = [t for t in trades if t["action"] == "BUY"]
+    sells  = [t for t in trades if t["action"] == "SELL"]
+    net_pnl     = sum(t["pnl"] for t in sells)
+    avg_buy     = (sum(t["fill_price"] for t in buys)  / len(buys))  if buys  else 0.0
+    avg_sell    = (sum(t["fill_price"] for t in sells) / len(sells)) if sells else 0.0
+    pnl_sign    = "+" if net_pnl >= 0 else ""
+    broadcast(notify_chats,
+              f"✅ <b>{ticker}</b> /get2 session complete ({total_runs} runs)\n"
+              f"Trades: {len(buys)} BUY  ·  {len(sells)} SELL\n"
+              f"Avg buy: ${avg_buy:.2f}  ·  Avg sell: ${avg_sell:.2f}\n"
+              f"Net P&amp;L: {pnl_sign}${net_pnl:.2f}")
+    print(f"[Bot] /get2 session {session_id} for {ticker} complete.")
+
+
 # ── Command handlers ──────────────────────────────────────────────────────────
 
 def handle_ticker(chat_id: str, args: list) -> None:
@@ -387,6 +603,76 @@ def handle_get(chat_id: str, args: list) -> None:
     thread.start()
 
 
+def handle_get2(chat_id: str, args: list) -> None:
+    if not IBKR_AVAILABLE:
+        send(chat_id, "⚠️ IBKR not available. Run: pip install ib_insync")
+        return
+
+    if not args:
+        send(chat_id, "Usage: /get2 &lt;STOCK&gt; [agent] &lt;runs&gt; &lt;interval&gt; &lt;budget&gt;\nExample: /get2 NVDA claude 10 20 50")
+        return
+
+    ticker       = args[0].upper()
+    agent_name   = "claude"
+    total_runs   = 1
+    interval_min = 20
+    budget       = None
+
+    remaining = args[1:]
+    int_count = 0
+    for val in remaining:
+        vl = val.lower()
+        if vl in VALID_AGENTS:
+            agent_name = vl
+        elif val.isdigit():
+            n = int(val)
+            if int_count == 0 and 1 <= n <= 500:
+                total_runs = n
+                int_count += 1
+            elif int_count == 1 and 5 <= n <= 240:
+                interval_min = n
+                int_count += 1
+            elif int_count == 2 and n > 0:
+                budget = float(n)
+                int_count += 1
+
+    if budget is None or budget <= 0:
+        send(chat_id, "⚠️ Budget is required and must be > 0.\nExample: /get2 NVDA claude 10 20 50")
+        return
+
+    existing = get_active_get2_session_for_ticker(ticker)
+    if existing:
+        send(chat_id,
+             f"⚠️ <b>{ticker}</b> already has an active /get2 session (<code>{existing['session_id']}</code>, "
+             f"started {existing['started_at'][:16]} UTC).\nUse /stop {ticker} first.")
+        return
+
+    session_id = create_session(ticker, agent_name, total_runs, interval_min)
+    create_get2_meta(session_id, budget)
+
+    notify_chats = [chat_id]
+    if MAIN_CHAT and MAIN_CHAT != chat_id:
+        notify_chats.append(MAIN_CHAT)
+
+    agent_label = "Claude + Gemini + Mistral" if agent_name == "all" else agent_name.title()
+    duration_h  = round(total_runs * interval_min / 60, 1)
+
+    send(chat_id,
+         f"🤖 <b>Automated trading started</b>  ·  session: <code>{session_id}</code>\n"
+         f"Ticker: <b>{ticker}</b>  ·  Agent: [{agent_label}]\n"
+         f"Runs: {total_runs} × {interval_min} min = {duration_h}h  ·  Budget: ${budget:.2f}\n"
+         f"<i>Use /stop {ticker} to cancel early.</i>")
+
+    thread = threading.Thread(
+        target=_run_get2_loop,
+        args=(session_id, chat_id, notify_chats, ticker, agent_name, total_runs, interval_min, budget),
+        name=f"get2-{ticker}-{session_id}",
+        daemon=True,
+    )
+    _active_sessions[session_id] = thread
+    thread.start()
+
+
 def handle_stop(chat_id: str, args: list) -> None:
     """Cancel an active /get session."""
     if not args:
@@ -445,6 +731,92 @@ def handle_summary(chat_id: str, args: list) -> None:
     send(chat_id, format_summary(session, run_dicts))
 
 
+def handle_portfolio(chat_id: str, args: list) -> None:
+    if not IBKR_AVAILABLE or get_ibkr_client is None:
+        send(chat_id, "⚠️ IBKR not available. Run: pip install ib_insync")
+        return
+    ibkr = get_ibkr_client()
+    if not ibkr.is_connected():
+        send(chat_id, "⚠️ IBKR not connected. Start IB Gateway first.")
+        return
+    try:
+        summary   = ibkr.account_summary()
+        positions = ibkr.get_all_positions()
+    except Exception as e:
+        send(chat_id, f"❌ Failed to fetch portfolio: {html.escape(str(e))}")
+        return
+
+    cash         = summary.get("AvailableFunds", summary.get("TotalCashValue", 0))
+    net_liq      = summary.get("NetLiquidation", 0)
+    buying_power = summary.get("BuyingPower", 0)
+    unrealized   = summary.get("UnrealizedPnL", 0)
+    unreal_sign  = "+" if unrealized >= 0 else ""
+
+    lines = [
+        "<b>📊 IBKR Portfolio</b>",
+        f"Cash: ${cash:,.2f}  ·  Net Liq: ${net_liq:,.2f}  ·  Buying Power: ${buying_power:,.2f}",
+        f"Unrealized P&amp;L: {unreal_sign}${unrealized:,.2f}",
+    ]
+
+    if positions:
+        lines.append("")
+        lines.append("<b>Positions:</b>")
+        for p in positions:
+            sym      = html.escape(str(p.get("ticker", "")))
+            qty      = p.get("quantity", 0)
+            avg_cost = p.get("avg_cost", 0)
+            mkt_val  = p.get("market_value", 0)
+            cost     = qty * avg_cost
+            unreal_p = mkt_val - cost if cost else 0
+            sign     = "+" if unreal_p >= 0 else ""
+            lines.append(
+                f"  <b>{sym}</b>  qty: {qty}  avg: ${avg_cost:.2f}  "
+                f"mkt: ${mkt_val:,.2f}  P&amp;L: {sign}${unreal_p:.2f}"
+            )
+    else:
+        lines.append("No open positions.")
+
+    send(chat_id, "\n".join(lines))
+
+
+def handle_trades(chat_id: str, args: list) -> None:
+    if not args:
+        send(chat_id, "Usage: /trades &lt;TICKER&gt;")
+        return
+    ticker = args[0].upper()
+    db = Path(__file__).resolve().parent / "get_state.db"
+    with sqlite3.connect(str(db)) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT s.session_id FROM get_sessions s "
+            "INNER JOIN get2_meta m ON s.session_id = m.session_id "
+            "WHERE s.ticker=? ORDER BY s.started_at DESC LIMIT 1",
+            (ticker,),
+        ).fetchone()
+    if not row:
+        send(chat_id, f"No /get2 sessions found for <b>{ticker}</b>.")
+        return
+    session_id = row["session_id"]
+    trades = get_get2_trades(session_id)
+    if not trades:
+        send(chat_id, f"No trades recorded for <b>{ticker}</b> session <code>{session_id}</code>.")
+        return
+    lines = [f"<b>📋 Trades — {ticker}</b>  session: <code>{session_id}</code>"]
+    for t in trades:
+        action     = t["action"]
+        qty        = t["quantity"]
+        fill_price = t["fill_price"]
+        pnl        = t["pnl"]
+        ts         = t["timestamp"][:16]
+        emoji      = "🟢" if action == "BUY" else "🔴"
+        pnl_str    = ""
+        if action == "SELL":
+            sign    = "+" if pnl >= 0 else ""
+            pnl_str = f"  P&amp;L: {sign}${pnl:.2f}"
+        lines.append(f"  {emoji} {action}  qty: {qty}  fill: ${fill_price:.2f}{pnl_str}  <i>{ts}</i>")
+    send(chat_id, "\n".join(lines))
+
+
 HELP_TEXT = (
     "<b>🤖 Signal Mesh Bot — Commands</b>\n\n"
     "<b>📊 ANALYSIS</b>\n"
@@ -463,10 +835,18 @@ HELP_TEXT = (
     "  /get ASML.AS gemini\n"
     "  /get NVDA claude 100 20\n"
     "  /get NVDA all 50 30 verbose\n\n"
+    "/get2 &lt;STOCK&gt; [agent] &lt;runs&gt; &lt;interval&gt; &lt;budget&gt;\n"
+    "  Like /get but auto-executes trades via IBKR.\n"
+    "  budget: USD amount per trade (e.g. 50 = buy $50 worth)\n"
+    "  Buys on first BUY signal, sells on SELL signal.\n"
+    "  Auto-liquidates on session end if position is open.\n"
+    "  Example: /get2 NVDA claude 10 20 50\n\n"
     "<b>🛑 CONTROL</b>\n"
     "/stop &lt;STOCK&gt;   — cancel active monitoring\n"
     "/status          — list all running sessions\n"
-    "/summary &lt;STOCK&gt; — summary of last session\n\n"
+    "/summary &lt;STOCK&gt; — summary of last session\n"
+    "/portfolio        — show current IBKR positions + cash balance\n"
+    "/trades &lt;TICKER&gt; — show trade history for last /get2 session\n\n"
     "<b>ℹ️ INFO</b>\n"
     "/help — this message\n\n"
     "<b>📌 TICKER FORMAT</b>\n"
@@ -555,6 +935,12 @@ def main() -> None:
                 handle_status(chat_id, args)
             elif command == "/summary":
                 handle_summary(chat_id, args)
+            elif command == "/get2":
+                handle_get2(chat_id, args)
+            elif command == "/portfolio":
+                handle_portfolio(chat_id, args)
+            elif command == "/trades":
+                handle_trades(chat_id, args)
             elif command in ("/start", "/help"):
                 send(chat_id, HELP_TEXT)
             else:

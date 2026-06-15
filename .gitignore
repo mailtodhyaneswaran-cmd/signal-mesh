@@ -36,6 +36,8 @@ Thumbs.db
 # ── Run outputs ───────────────────────────────────────────────────────────────
 int/bin/outputs/
 int/bin/get_state.db
+int/bin/get_state.db-shm
+int/bin/get_state.db-wal
 
 # ── Claude Code project files ─────────────────────────────────────────────────
 .claude/

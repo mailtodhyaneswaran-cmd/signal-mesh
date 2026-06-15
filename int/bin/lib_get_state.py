@@ -68,6 +68,34 @@ def init_db() -> None:
                 FOREIGN KEY (session_id) REFERENCES get_sessions(session_id)
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS get2_meta (
+                session_id         TEXT PRIMARY KEY,
+                budget             REAL NOT NULL,
+                currency           TEXT NOT NULL DEFAULT 'USD',
+                position_status    TEXT NOT NULL DEFAULT 'none',
+                position_qty       REAL NOT NULL DEFAULT 0,
+                position_buy_price REAL NOT NULL DEFAULT 0,
+                FOREIGN KEY (session_id) REFERENCES get_sessions(session_id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS get2_trades (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id     TEXT NOT NULL,
+                run_n          INTEGER NOT NULL,
+                action         TEXT NOT NULL,
+                ticker         TEXT NOT NULL,
+                quantity       REAL NOT NULL DEFAULT 0,
+                dollar_amount  REAL NOT NULL DEFAULT 0,
+                fill_price     REAL NOT NULL DEFAULT 0,
+                ibkr_order_id  INTEGER,
+                ibkr_status    TEXT,
+                pnl            REAL DEFAULT 0,
+                timestamp      TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES get_sessions(session_id)
+            )
+        """)
         conn.commit()
 
 
@@ -220,6 +248,93 @@ def get_active_session_for_ticker(ticker: str) -> dict | None:
         row = conn.execute(
             "SELECT * FROM get_sessions WHERE ticker=? AND status='active' "
             "ORDER BY started_at DESC LIMIT 1",
+            (ticker.upper(),),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def create_get2_meta(session_id: str, budget: float, currency: str = "USD") -> None:
+    """Create the get2-specific metadata row for a session."""
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO get2_meta (session_id, budget, currency, position_status, position_qty, position_buy_price) "
+            "VALUES (?, ?, ?, 'none', 0, 0)",
+            (session_id, budget, currency),
+        )
+        conn.commit()
+
+
+def update_get2_position(session_id: str, status: str, qty: float, buy_price: float) -> None:
+    """Update position state: status='none'|'long', qty, buy_price."""
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE get2_meta SET position_status=?, position_qty=?, position_buy_price=? WHERE session_id=?",
+            (status, qty, buy_price, session_id),
+        )
+        conn.commit()
+
+
+def get_get2_meta(session_id: str) -> dict | None:
+    """Return get2 metadata for a session, or None."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM get2_meta WHERE session_id=?",
+            (session_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def record_get2_trade(
+    session_id: str, run_n: int, action: str, ticker: str,
+    quantity: float, dollar_amount: float, fill_price: float,
+    ibkr_order_id: int | None, ibkr_status: str | None, pnl: float = 0.0,
+) -> None:
+    """Insert a trade execution record."""
+    from datetime import datetime, timezone
+    timestamp = datetime.now(timezone.utc).isoformat()
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO get2_trades "
+            "(session_id, run_n, action, ticker, quantity, dollar_amount, fill_price, ibkr_order_id, ibkr_status, pnl, timestamp) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (session_id, run_n, action, ticker.upper(), quantity, dollar_amount, fill_price,
+             ibkr_order_id, ibkr_status, pnl, timestamp),
+        )
+        conn.commit()
+
+
+def get_get2_trades(session_id: str) -> list[dict]:
+    """Return all trades for a session, newest first."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM get2_trades WHERE session_id=? ORDER BY id DESC",
+            (session_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_active_get2_sessions() -> list[dict]:
+    """Return active get2 sessions joined with get2_meta."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT s.*, m.budget, m.currency, m.position_status, m.position_qty, m.position_buy_price "
+            "FROM get_sessions s "
+            "INNER JOIN get2_meta m ON s.session_id = m.session_id "
+            "WHERE s.status='active' "
+            "ORDER BY s.started_at",
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_active_get2_session_for_ticker(ticker: str) -> dict | None:
+    """Return the most recent active get2 session for ticker, or None."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT s.*, m.budget, m.currency, m.position_status, m.position_qty, m.position_buy_price "
+            "FROM get_sessions s "
+            "INNER JOIN get2_meta m ON s.session_id = m.session_id "
+            "WHERE s.ticker=? AND s.status='active' "
+            "ORDER BY s.started_at DESC LIMIT 1",
             (ticker.upper(),),
         ).fetchone()
     return dict(row) if row else None
