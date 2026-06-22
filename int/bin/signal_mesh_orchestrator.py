@@ -41,6 +41,8 @@ import math
 import os
 import sys
 import threading
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -453,8 +455,9 @@ def analyze_single_ticker(
         result = agents[0].fetch_data(prompt)
         if "error" in result and "signal" not in result:
             return {"error": result.get("error", "agent error"), "signal": "HOLD", "factor_score": 50, "confidence": 0}
-        result["timestamp"] = now_iso
-        result["price"]     = stock_data.get("price", 0)
+        result["timestamp"]     = now_iso
+        result["price"]         = stock_data.get("price", 0)
+        result["has_stub_data"] = True
         return result
 
     # ── Multi-agent: majority vote ─────────────────────────────────────────
@@ -491,6 +494,90 @@ def analyze_single_ticker(
     base["factor_score"] = avg_score
     base["confidence"]   = avg_conf
 
+    # ── Aggregate trade levels across all agents ───────────────────────────
+    def _avg_numeric(key: str):
+        vals = [r.get(key) for r in responses if r.get(key) is not None]
+        if not vals:
+            return None
+        try:
+            return round(sum(float(v) for v in vals) / len(vals), 2)
+        except (TypeError, ValueError):
+            return vals[0]
+
+    agg_entry  = _avg_numeric("entry")
+    agg_target = _avg_numeric("target")
+
+    # Most conservative stop: max stop price (tightest risk control for longs)
+    stop_vals = [r.get("stop_loss") for r in responses if r.get("stop_loss") is not None]
+    if stop_vals:
+        try:
+            agg_stop = round(max(float(v) for v in stop_vals), 2)
+        except (TypeError, ValueError):
+            agg_stop = stop_vals[0]
+    else:
+        agg_stop = None
+
+    base["entry"]     = agg_entry
+    base["stop_loss"] = agg_stop
+    base["target"]    = agg_target
+
+    # Recompute R:R from aggregated levels (don't average ratios)
+    if agg_entry and agg_stop and agg_target and agg_entry != agg_stop:
+        try:
+            base["risk_reward"] = round((agg_target - agg_entry) / (agg_entry - agg_stop), 2)
+        except ZeroDivisionError:
+            pass
+
+    agg_horizon = _avg_numeric("horizon_days")
+    if agg_horizon is not None:
+        base["horizon_days"] = int(round(agg_horizon))
+
+    # ── Aggregate per-category scores ─────────────────────────────────────
+    def _modal_verdict(verdicts: list) -> str:
+        if not verdicts:
+            return ""
+        counts: dict = {}
+        for v in verdicts:
+            counts[v] = counts.get(v, 0) + 1
+        return max(counts, key=counts.__getitem__)
+
+    merged_cats: dict = {}
+    for r in responses:
+        for cat, cat_data in (r.get("scores") or {}).items():
+            if cat not in merged_cats:
+                merged_cats[cat] = {"scores": [], "deltas": [], "verdicts": []}
+            if cat_data.get("score") is not None:
+                try:
+                    merged_cats[cat]["scores"].append(float(cat_data["score"]))
+                except (TypeError, ValueError):
+                    pass
+            if cat_data.get("delta") is not None:
+                try:
+                    merged_cats[cat]["deltas"].append(float(cat_data["delta"]))
+                except (TypeError, ValueError):
+                    pass
+            if cat_data.get("verdict"):
+                merged_cats[cat]["verdicts"].append(str(cat_data["verdict"]))
+
+    if merged_cats:
+        base["scores"] = {
+            cat: {
+                "score":   round(sum(d["scores"]) / len(d["scores"]), 1) if d["scores"] else 0,
+                "delta":   round(sum(d["deltas"]) / len(d["deltas"]), 1) if d["deltas"] else None,
+                "verdict": _modal_verdict(d["verdicts"]),
+            }
+            for cat, d in merged_cats.items()
+        }
+
+    # ── Aggregate baseline delta fields ───────────────────────────────────
+    for delta_key in ("score_delta_vs_baseline", "price_delta_vs_baseline_pct"):
+        vals = [r.get(delta_key) for r in responses if r.get(delta_key) is not None]
+        if vals:
+            try:
+                base[delta_key] = round(sum(float(v) for v in vals) / len(vals), 2)
+            except (TypeError, ValueError):
+                base[delta_key] = vals[0]
+
     # Deduplicate and merge catalysts / risks (up to 5 each)
     def _merge_list(key: str) -> list:
         seen: set = set()
@@ -511,8 +598,9 @@ def analyze_single_ticker(
         base["new_catalysts"] = _merge_list("new_catalysts")
         base["new_risks"]     = _merge_list("new_risks")
 
-    base["timestamp"] = now_iso
-    base["price"]     = stock_data.get("price", 0)
+    base["timestamp"]     = now_iso
+    base["price"]         = stock_data.get("price", 0)
+    base["has_stub_data"] = True
     return base
 
 
@@ -1146,6 +1234,41 @@ def print_results(results: list[dict], euro: bool = False):
 # Reads TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID from environment variables.
 # Sends a formatted HTML message with results + per-agent reliability stats.
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _send_with_retry(url: str, chat_id: str, text: str, max_attempts: int = 3) -> None:
+    """Send one Telegram message with exponential backoff on 429 / transient errors."""
+    params = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    for attempt in range(max_attempts):
+        try:
+            data = urllib.parse.urlencode(params).encode()
+            req  = urllib.request.Request(url, data=data, method="POST")
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                body = json.loads(resp.read().decode())
+            if body.get("ok"):
+                print("[TELEGRAM] Notification sent.")
+            else:
+                print(f"[TELEGRAM] API returned ok=false: {body}")
+            return
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                try:
+                    wait = json.loads(e.read().decode()).get("parameters", {}).get("retry_after", 2 ** attempt)
+                except Exception:
+                    wait = 2 ** attempt
+                print(f"[TELEGRAM] Rate limited (429), retrying in {wait}s...")
+                if attempt < max_attempts - 1:
+                    time.sleep(wait)
+                    continue
+            print(f"[TELEGRAM] HTTP error {e.code}: {e}")
+            if attempt < max_attempts - 1:
+                time.sleep(2 ** attempt)
+        except Exception as e:
+            print(f"[TELEGRAM] Send error: {e}")
+            if attempt < max_attempts - 1:
+                time.sleep(2 ** attempt)
+    print("[TELEGRAM] Failed after max retries.")
+
+
 def send_telegram_notification(results: list[dict], agents_label: str, euro: bool = False):
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     chat_id   = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -1153,66 +1276,11 @@ def send_telegram_notification(results: list[dict], agents_label: str, euro: boo
         print("[TELEGRAM] Skipped — set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to enable.")
         return
 
-    currency_label = "EUR · Trade Republic" if euro else "USD · Global"
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    sorted_results = sorted(results, key=lambda x: x.get("weighted_score", 0), reverse=True)
-
-    signal_emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}
-
-    lines = [
-        f"<b>📊 Signal Mesh — {currency_label}</b>",
-        f"{now}  ·  agents=[{agents_label}]",
-        "",
-        "<b>Results (ranked by score):</b>",
-    ]
-    for r in sorted_results:
-        sig   = r.get("final_signal", "HOLD")
-        emoji = signal_emoji.get(sig, "⚪")
-        fails = sum(v.get("failed", 0) for v in r.get("agent_reliability", {}).values())
-        fail_tag = f"  ⚠️{fails}skip" if fails else ""
-        lines.append(
-            f"  {emoji} <b>{r['ticker']}</b>  {sig}  {r['weighted_score']:.1f}"
-            f"  B:{r['buy_count']} S:{r['sell_count']} H:{r['hold_count']}{fail_tag}"
-        )
-
-    top = sorted_results[0] if sorted_results else None
-    if top and top["final_signal"] == "BUY":
-        total_votes = top["buy_count"] + top["sell_count"] + top["hold_count"]
-        lines += [
-            "",
-            f"🏆 <b>Top pick: {top['ticker']}</b>  "
-            f"(score {top['weighted_score']:.1f}, {top['buy_count']}/{total_votes} BUY votes)",
-        ]
-
-    # Aggregate reliability across all stocks
-    reliability: dict[str, dict] = {}
-    for r in results:
-        for name, stats in r.get("agent_reliability", {}).items():
-            if name not in reliability:
-                reliability[name] = {"proper": 0, "failed": 0}
-            reliability[name]["proper"] += stats.get("proper", 0)
-            reliability[name]["failed"] += stats.get("failed", 0)
-
-    if reliability:
-        lines += ["", "<b>Agent Reliability:</b>"]
-        for name, stats in reliability.items():
-            total = stats["proper"] + stats["failed"]
-            pct   = round(stats["proper"] / total * 100) if total else 0
-            icon  = "✅" if pct >= 90 else "⚠️" if pct >= 70 else "❌"
-            lines.append(f"  {icon} {name}: {stats['proper']}/{total} proper replies ({pct}%)")
-
-    text = "\n".join(lines)
-    data = urllib.parse.urlencode({"chat_id": chat_id, "text": text, "parse_mode": "HTML"}).encode()
-    try:
-        req = urllib.request.Request(
-            f"https://api.telegram.org/bot{bot_token}/sendMessage",
-            data=data, method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            ok = json.loads(resp.read().decode()).get("ok", False)
-        print("[TELEGRAM] Notification sent." if ok else "[TELEGRAM] API returned ok=false.")
-    except Exception as e:
-        print(f"[TELEGRAM] Failed to send: {e}")
+    from lib_telegram_format import format_batch
+    messages = format_batch(results, agents_label=agents_label, euro=euro)
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    for text in messages:
+        _send_with_retry(url, chat_id, text)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

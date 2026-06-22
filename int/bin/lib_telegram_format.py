@@ -9,12 +9,20 @@ Public API:
   format_report(parsed, run_n, total_runs, interval_min) -> list[str]
       Returns 1 or 2 HTML message strings.  Split at the THESIS section
       if the combined length would exceed 4096 chars.
+      Set parsed["has_stub_data"] = True to append a MACR/SENT stub warning.
 
   format_pulse(parsed, run_n, total_runs) -> str
       One-line quiet-mode status string.
 
   format_summary(session, runs) -> str
       Post-session summary: signal stability, flips, price range, score range.
+
+  format_batch(results, agents_label, euro) -> list[str]
+      Format bulk analysis results (daily run or /ticker) ranked by score.
+      Accepts run_bulk_prompts_for_ticker() / run_all_prompts_for_ticker() dicts.
+
+  split_message(text, max_len) -> list[str]
+      Split a long string into Telegram-safe chunks (≤ max_len chars).
 """
 
 import html
@@ -204,6 +212,9 @@ def format_report(
         for w in watch_for:
             lines_body.append(f"- {_esc(w)}")
 
+    if parsed.get("has_stub_data"):
+        lines_body += ["", "<i>⚠ MACR/SENT = stub data — not live signals</i>"]
+
     part2 = "\n".join(lines_body)
 
     # ── Combine, splitting at THESIS if needed ────────────────────────────
@@ -303,3 +314,137 @@ def format_summary(session: dict, runs: list) -> str:
     ]
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# split_message  (shared helper used by all three paths)
+# ---------------------------------------------------------------------------
+
+def split_message(text: str, max_len: int = 4096) -> list[str]:
+    """Split text into chunks of at most max_len characters, breaking at newlines."""
+    if len(text) <= max_len:
+        return [text]
+    chunks = []
+    while text:
+        if len(text) <= max_len:
+            chunks.append(text)
+            break
+        split_at = text.rfind("\n", 0, max_len)
+        if split_at <= 0:
+            split_at = max_len - 3
+            chunks.append(text[:split_at] + "...")
+        else:
+            chunks.append(text[:split_at])
+        text = text[split_at:].lstrip("\n")
+    return chunks
+
+
+# ---------------------------------------------------------------------------
+# format_batch  (daily run + /ticker one-shot)
+# ---------------------------------------------------------------------------
+
+_CATEGORY_SHORT: dict[str, str] = {
+    "tr_technical":   "TECH",
+    "tr_fundamental": "FUND",
+    "tr_sentiment":   "SENT",
+    "tr_macro":       "MACR",
+    "tr_quant":       "QUAN",
+    "technical":      "TECH",
+    "fundamental":    "FUND",
+    "sentiment":      "SENT",
+    "macro":          "MACR",
+    "quant":          "QUAN",
+}
+
+
+def format_batch(
+    results: list[dict],
+    agents_label: str = "",
+    euro: bool = False,
+) -> list[str]:
+    """Format bulk analysis results (daily run or /ticker) into Telegram HTML.
+
+    Accepts results in the run_bulk_prompts_for_ticker() / run_all_prompts_for_ticker()
+    format: ticker, final_signal, weighted_score, buy_count, sell_count, hold_count,
+    category_scores, agent_reliability.
+
+    Returns a list of message strings split at 4096 chars as needed.
+    """
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    currency_label = "EUR · Trade Republic" if euro else "USD · Global"
+
+    sorted_results = sorted(results, key=lambda x: x.get("weighted_score", 0), reverse=True)
+
+    header = f"<b>📊 Signal Mesh — {currency_label}</b>"
+    subheader = now + (f"  ·  agents=[{_esc(agents_label)}]" if agents_label else "")
+
+    lines = [header, subheader, "", "<b>Results (ranked by score):</b>"]
+
+    for r in sorted_results:
+        sig    = str(r.get("final_signal", "HOLD")).upper()
+        emoji  = _SIGNAL_EMOJI.get(sig, "⚪")
+        ticker = _esc(r.get("ticker", "?"))
+        score  = r.get("weighted_score", 0) or 0
+        b = r.get("buy_count", 0)
+        s = r.get("sell_count", 0)
+        h = r.get("hold_count", 0)
+        fails = sum(v.get("failed", 0) for v in r.get("agent_reliability", {}).values())
+        fail_tag = f"  ⚠️{fails}skip" if fails else ""
+
+        row = f"  {emoji} <b>{ticker}</b>  {sig}  {score:.1f}  B:{b} S:{s} H:{h}{fail_tag}"
+
+        # Optional trade levels (populated when bulk path emits them)
+        stop   = r.get("stop_loss")
+        target = r.get("target")
+        if stop is not None or target is not None:
+            trade_parts = []
+            if target is not None:
+                trade_parts.append(f"Tgt ${_fmt_price(target)}")
+            if stop is not None:
+                trade_parts.append(f"Stop ${_fmt_price(stop)}")
+            row += f"  [{', '.join(trade_parts)}]"
+
+        trend = r.get("trend_label") or r.get("trend")
+        if trend:
+            row += f"  [{_esc(str(trend).upper())}]"
+
+        lines.append(row)
+
+        cat_scores = r.get("category_scores", {})
+        if cat_scores:
+            cat_str = "  ".join(
+                f"{_CATEGORY_SHORT.get(c, c.split('_')[-1][:4].upper())}={v:.0f}"
+                for c, v in cat_scores.items()
+            )
+            lines.append(f"    {cat_str}")
+
+    # Top pick
+    top = sorted_results[0] if sorted_results else None
+    if top and top.get("final_signal") == "BUY":
+        total_votes = top.get("buy_count", 0) + top.get("sell_count", 0) + top.get("hold_count", 0)
+        lines += [
+            "",
+            f"🏆 <b>Top pick: {_esc(top.get('ticker', '?'))}</b>  "
+            f"(score {top.get('weighted_score', 0):.1f}, {top.get('buy_count', 0)}/{total_votes} BUY votes)",
+        ]
+
+    # Agent reliability (aggregated across all results)
+    reliability: dict[str, dict] = {}
+    for r in results:
+        for name, stats in r.get("agent_reliability", {}).items():
+            if name not in reliability:
+                reliability[name] = {"proper": 0, "failed": 0}
+            reliability[name]["proper"] += stats.get("proper", 0)
+            reliability[name]["failed"] += stats.get("failed", 0)
+
+    if reliability:
+        lines += ["", "<b>Agent Reliability:</b>"]
+        for name, stats in reliability.items():
+            total = stats["proper"] + stats["failed"]
+            pct   = round(stats["proper"] / total * 100) if total else 0
+            icon  = "✅" if pct >= 90 else "⚠️" if pct >= 70 else "❌"
+            lines.append(f"  {icon} {_esc(name)}: {stats['proper']}/{total} proper replies ({pct}%)")
+
+    lines += ["", "<i>⚠ MACR/SENT = stub data — not live signals</i>"]
+
+    return split_message("\n".join(lines))

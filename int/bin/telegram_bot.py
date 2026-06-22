@@ -29,6 +29,7 @@ import sqlite3
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -52,7 +53,7 @@ from lib_get_state import (
     get_active_get2_session_for_ticker,
 )
 from lib_market_hours import is_market_open, next_market_open
-from lib_telegram_format import format_report, format_pulse, format_summary
+from lib_telegram_format import format_report, format_pulse, format_summary, format_batch
 try:
     from lib_ibkr import get_client as get_ibkr_client, IBKR_AVAILABLE
 except ImportError:
@@ -73,11 +74,30 @@ _active_sessions: dict = {}   # session_id -> threading.Thread
 # ── Telegram API helpers ──────────────────────────────────────────────────────
 
 def _api(method: str, params: dict, timeout: int = 35) -> dict:
-    data = urllib.parse.urlencode(params).encode()
-    url  = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
-    req  = urllib.request.Request(url, data=data, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode())
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    for attempt in range(3):
+        try:
+            data = urllib.parse.urlencode(params).encode()
+            req  = urllib.request.Request(url, data=data, method="POST")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                try:
+                    wait = json.loads(e.read().decode()).get("parameters", {}).get("retry_after", 2 ** attempt)
+                except Exception:
+                    wait = 2 ** attempt
+                print(f"[Bot] Rate limited (429) on {method}, retrying in {wait}s...")
+                if attempt < 2:
+                    time.sleep(wait)
+                    continue
+            raise
+        except Exception:
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+            raise
+    raise RuntimeError(f"_api({method}): max retries exceeded")
 
 
 def send(chat_id: str, text: str) -> None:
@@ -147,39 +167,10 @@ def _run_analysis(requester_id: str, notify_chats: list, ticker: str, agent_name
         broadcast(notify_chats, f"❌ Analysis failed for <b>{ticker}</b>: {e}")
         return
 
-    # Format result
-    sig   = result["final_signal"]
-    score = result["weighted_score"]
-    emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(sig, "⚪")
-    total = result["buy_count"] + result["sell_count"] + result["hold_count"]
-    now   = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
-    cat_lines = "\n".join(
-        f"  {c.split('_')[-1][:4].upper()}: {v:.1f}"
-        for c, v in result.get("category_scores", {}).items()
-    )
-
-    reliability_lines = []
-    for name, stats in result.get("agent_reliability", {}).items():
-        t    = stats["proper"] + stats["failed"]
-        pct  = round(stats["proper"] / t * 100) if t else 0
-        icon = "✅" if pct >= 90 else "⚠️" if pct >= 70 else "❌"
-        reliability_lines.append(f"  {icon} {name}: {stats['proper']}/{t} ({pct}%)")
-
-    lines = [
-        f"<b>📊 Signal Mesh — {ticker}</b>",
-        f"{now}  ·  [{agents_label}]{by_tag}",
-        "",
-        f"{emoji} <b>{sig}</b>  score: {score:.1f}",
-        f"Votes: {result['buy_count']} BUY  ·  {result['sell_count']} SELL  ·  {result['hold_count']} HOLD  ({total} total)",
-        "",
-        "<b>Category Breakdown:</b>",
-        cat_lines,
-    ]
-    if reliability_lines:
-        lines += ["", "<b>Agent Reliability:</b>"] + reliability_lines
-
-    broadcast(notify_chats, "\n".join(lines))
+    msgs = format_batch([result], agents_label=agents_label, euro=False)
+    for i, msg in enumerate(msgs):
+        out = msg + by_tag if (by_tag and i == 0) else msg
+        broadcast(notify_chats, out)
     print(f"[Bot] Analysis complete for {ticker} ({agent_name}) — sent to {notify_chats}.")
 
 
