@@ -83,7 +83,7 @@ from lib_env import load_dotenv
 VERBOSE = False
 
 # ── Configurable run parameters ───────────────────────────────────────────────
-NUM_STOCKS = 3   # number of trending stocks to analyse per run (Step 1 discovers this many)
+NUM_STOCKS = 5   # number of trending stocks to analyse per run (Step 1 discovers this many)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -105,10 +105,43 @@ def discover_trending_stocks(agent: BaseAgent) -> list[str]:
         print("[ERROR] STEP1 returned no stocks. Cannot continue without a watchlist.")
         sys.exit(1)
 
-    tickers = [s["ticker"] for s in stocks if "ticker" in s]
+    # Map exchange names to yfinance suffixes for non-US markets
+    _EXCHANGE_SUFFIX = {
+        "xetra":               ".DE",
+        "frankfurt":           ".DE",
+        "lse":                 ".L",
+        "london":              ".L",
+        "euronext amsterdam":  ".AS",
+        "euronext paris":      ".PA",
+        "euronext brussels":   ".BR",
+        "euronext lisbon":     ".LS",
+        "borsa italiana":      ".MI",
+        "milan":               ".MI",
+        "six":                 ".SW",
+        "zurich":              ".SW",
+        "omx stockholm":       ".ST",
+        "omx copenhagen":      ".CO",
+        "omx helsinki":        ".HE",
+        "oslo":                ".OL",
+    }
+
+    def _resolve_ticker(s: dict) -> str:
+        raw      = s.get("ticker", "")
+        exchange = s.get("exchange", "").strip().lower()
+        market   = s.get("market", "").strip().upper()
+        if market == "US" or not exchange:
+            return raw
+        # Already has a suffix (e.g. ASML.AS returned directly)
+        if "." in raw:
+            return raw
+        suffix = _EXCHANGE_SUFFIX.get(exchange, "")
+        return raw + suffix if suffix else raw
+
+    tickers = [_resolve_ticker(s) for s in stocks if s.get("ticker")]
     print(f"  Discovered: {' · '.join(tickers)}")
-    for s in stocks:
-        print(f"    [{s.get('rank','?')}] {s.get('ticker','?'):6s}  buzz={s.get('buzz_score','?'):>3}  "
+    for s, t in zip(stocks, tickers):
+        label = f" → {t}" if t != s.get("ticker") else ""
+        print(f"    [{s.get('rank','?')}] {s.get('ticker','?'):6s}{label:12s}  buzz={s.get('buzz_score','?'):>3}  "
               f"sentiment={s.get('sentiment','?'):8s}  {s.get('reason','')[:60]}")
     return tickers
 
